@@ -30,12 +30,12 @@ const (
 
 const (
 	// DeliveryScope is the claim value a delivery token must carry. It is checked as an
-	// exact string rather than as a prefix: "reference-consumer.deliver.readonly" must not
-	// satisfy a rule written for "reference-consumer.deliver".
-	DeliveryScope = "reference-consumer.deliver"
+	// exact string rather than as a prefix: "foundation-reference.deliver.readonly" must not
+	// satisfy a rule written for "foundation-reference.deliver".
+	DeliveryScope = "foundation-reference.deliver"
 
 	// CallerScope is what an operation caller must carry.
-	CallerScope = "reference-consumer.operate"
+	CallerScope = "foundation-reference.operate"
 
 	// scopeClaim is the claim the estate puts scopes in. It is configuration in a real
 	// deployment because it is a property of the realm; here it is fixed because this
@@ -140,8 +140,8 @@ func bearer(r *http.Request) (string, error) {
 
 // hasScope reads the space-delimited scope claim, comparing whole entries.
 //
-// A substring match would accept "reference-consumer.deliver" inside
-// "not-reference-consumer.deliverance", which is the classic way a scope check passes for a
+// A substring match would accept "foundation-reference.deliver" inside
+// "not-foundation-reference.deliverance", which is the classic way a scope check passes for a
 // token that was never granted the scope.
 func hasScope(claims verify.Claims, required string) bool {
 	raw, ok := claims.String(scopeClaim)

@@ -9,8 +9,8 @@ import (
 
 	"github.com/anshacerbia2/foundation-platform/event"
 
-	"github.com/anshacerbia2/reference-consumer/internal/httpapi"
-	"github.com/anshacerbia2/reference-consumer/internal/projection"
+	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 type stubDeliveries struct{}

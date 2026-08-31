@@ -4,7 +4,7 @@
 // It is a separate module on purpose. A consumer living inside organization-control, or
 // inside a BFF that ships with a UI, cannot demonstrate cross-product enforcement -- the
 // process boundary is the property under test.
-module github.com/anshacerbia2/reference-consumer
+module github.com/anshacerbia2/foundation-reference
 
 // The language floor matches foundation-platform rather than the toolchain CI builds with,
 // the same way the two control repositories state it.

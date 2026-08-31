@@ -1,4 +1,4 @@
-// Command reference-consumer is the enforcing consumer for Proof A.
+// Command foundation-reference is the enforcing consumer for Proof A.
 //
 // It exists to answer one question with evidence: does a membership revocation in
 // organization-control become a refused operation in a different process, within a delay
@@ -23,9 +23,9 @@ import (
 	"github.com/anshacerbia2/foundation-platform/observability"
 	"github.com/anshacerbia2/foundation-platform/verify"
 
-	"github.com/anshacerbia2/reference-consumer/internal/config"
-	"github.com/anshacerbia2/reference-consumer/internal/httpapi"
-	"github.com/anshacerbia2/reference-consumer/internal/projection"
+	"github.com/anshacerbia2/foundation-reference/internal/config"
+	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 func main() {

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	Deployable = "reference-consumer"
+	Deployable = "foundation-reference"
 
 	// System is the SAD this deployable belongs to. It exists to prove one property of
 	// SAD-004: that an authority change in organization-control becomes enforcement in

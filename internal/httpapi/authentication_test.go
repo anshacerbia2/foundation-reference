@@ -20,12 +20,12 @@ import (
 
 	"github.com/anshacerbia2/foundation-platform/verify"
 
-	"github.com/anshacerbia2/reference-consumer/internal/httpapi"
+	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
 )
 
 const (
 	testIssuer   = "https://issuer.test"
-	testAudience = "reference-consumer"
+	testAudience = "foundation-reference"
 	testKID      = "test-key"
 )
 
@@ -197,7 +197,7 @@ func TestScopeIsMatchedWholeGuardsAgainstSubstringAcceptance(t *testing.T) {
 	for _, scope := range []string{
 		httpapi.DeliveryScope + ".readonly",
 		"not-" + httpapi.DeliveryScope,
-		"reference-consumer.deliverance",
+		"foundation-reference.deliverance",
 	} {
 		recorder := served(t, chain, "Bearer "+token(t, key, scope))
 		if recorder.Code != http.StatusForbidden {

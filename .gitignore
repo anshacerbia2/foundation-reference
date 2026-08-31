@@ -3,8 +3,8 @@
 coverage
 
 # Binaries produced by `go build` without -o.
-/reference-consumer
-/reference-migrate
+/foundation-reference
+/foundation-reference-migrate
 
 # Local development environment. .env.example is committed; the real one is not.
 .env

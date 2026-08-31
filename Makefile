@@ -39,11 +39,11 @@ env:
 
 migrate:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
-	go run ./cmd/reference-migrate
+	go run ./cmd/foundation-reference-migrate
 
 run:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
-	go run ./cmd/reference-consumer
+	go run ./cmd/foundation-reference
 
 # The body is a file. Quoting a CloudEvents envelope on a cmd line means escaping every
 # double quote, and one missed backslash produces a 400 that reads as the consumer rejecting

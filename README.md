@@ -1,4 +1,4 @@
-# reference-consumer
+# foundation-reference
 
 The enforcing consumer for **Proof A**: the deployable that answers, with evidence, whether a
 membership revocation in `organization-control` becomes a refused operation in a *different

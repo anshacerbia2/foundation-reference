@@ -14,7 +14,7 @@ import (
 	"github.com/anshacerbia2/foundation-platform/id"
 	"github.com/anshacerbia2/foundation-platform/observability"
 
-	"github.com/anshacerbia2/reference-consumer/internal/projection"
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 const maxDeliveryBody = 1 << 20

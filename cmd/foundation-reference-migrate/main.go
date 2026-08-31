@@ -18,7 +18,7 @@ import (
 	"github.com/anshacerbia2/foundation-platform/db"
 	platform "github.com/anshacerbia2/foundation-platform/migrations"
 
-	"github.com/anshacerbia2/reference-consumer/internal/projection"
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 func main() {
