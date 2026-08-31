@@ -1,0 +1,9 @@
+# Line endings are normalised to LF in the repository regardless of the platform a
+# contributor works on. Without this, a checkout with CRLF committed back would fail
+# gofmt on a Linux runner, and the diff would be every line of every file.
+* text=auto eol=lf
+
+# Generated and binary content is never diffed or normalised.
+*.png binary
+*.jpg binary
+*.zip binary
