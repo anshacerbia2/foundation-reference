@@ -21,6 +21,7 @@ import (
 	"github.com/anshacerbia2/foundation-platform/db"
 	fhttp "github.com/anshacerbia2/foundation-platform/httpapi"
 	"github.com/anshacerbia2/foundation-platform/observability"
+	"github.com/anshacerbia2/foundation-platform/verify"
 
 	"github.com/anshacerbia2/reference-consumer/internal/config"
 	"github.com/anshacerbia2/reference-consumer/internal/httpapi"
@@ -85,10 +86,47 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("enforcer: %w", err)
 	}
 
+	// The key source performs no fetch here: a cold replica loads the key set on its first
+	// verification, so the composition root decides when the network is touched rather than
+	// the linker.
+	keys, err := verify.NewJWKS(verify.JWKSConfig{URL: cfg.JWKSURL})
+	if err != nil {
+		return fmt.Errorf("jwks source: %w", err)
+	}
+
+	// The requirement is mandatory in verify, and it is where the scope claim is asserted to
+	// be present at all. Which scope satisfies which role is decided per route.
+	verifier, err := verify.New(verify.Config{
+		Issuer:   cfg.TokenIssuer,
+		Audience: cfg.TokenAudience,
+		Keys:     keys,
+		MaxSkew:  cfg.TokenMaxSkew,
+		Requirement: verify.RequirementFunc(func(claims verify.Claims) error {
+			if _, ok := claims.String("scope"); !ok {
+				return errors.New("the token carries no scope claim")
+			}
+			return nil
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("verifier: %w", err)
+	}
+
+	delivery, err := httpapi.Authenticate(verifier, httpapi.RoleDelivery)
+	if err != nil {
+		return fmt.Errorf("delivery authentication: %w", err)
+	}
+	caller, err := httpapi.Authenticate(verifier, httpapi.RoleCaller)
+	if err != nil {
+		return fmt.Errorf("caller authentication: %w", err)
+	}
+
 	surface, err := httpapi.Routes(httpapi.Config{
 		Projector: projector,
 		Enforcer:  enforcer,
 		Telemetry: telemetry,
+		Delivery:  delivery,
+		Caller:    caller,
 	})
 	if err != nil {
 		return fmt.Errorf("routes: %w", err)

@@ -44,6 +44,14 @@ type Config struct {
 
 	AuthorityTimeout time.Duration
 
+	// Token verification. Required rather than optional: this deployable writes a projection
+	// that decides whether other people's operations proceed, and a build that can start
+	// without a verifier is a build that can be deployed with authentication switched off.
+	TokenIssuer   string
+	TokenAudience string
+	JWKSURL       string
+	TokenMaxSkew  time.Duration
+
 	HTTPReadTimeout    time.Duration
 	HTTPWriteTimeout   time.Duration
 	HTTPRequestTimeout time.Duration
@@ -66,6 +74,25 @@ func Load() (Config, error) {
 	cfg.ListenAddress = stringOr("REFERENCE_LISTEN_ADDRESS", "127.0.0.1:8096")
 	cfg.AuthorityBaseURL = strings.TrimSpace(os.Getenv("REFERENCE_AUTHORITY_BASE_URL"))
 	cfg.LogLevel = stringOr("LOG_LEVEL", "info")
+
+	cfg.TokenIssuer = strings.TrimSpace(os.Getenv("REFERENCE_TOKEN_ISSUER"))
+	if cfg.TokenIssuer == "" {
+		problems = append(problems, errors.New("REFERENCE_TOKEN_ISSUER is required"))
+	}
+	cfg.TokenAudience = stringOr("REFERENCE_TOKEN_AUDIENCE", Deployable)
+	cfg.JWKSURL = strings.TrimSpace(os.Getenv("REFERENCE_JWKS_URL"))
+	if cfg.JWKSURL == "" {
+		problems = append(problems, errors.New("REFERENCE_JWKS_URL is required"))
+	}
+
+	// The ceiling is the substrate's, not a preference: STD-IAM-002 §3.5 caps it at 60s, and
+	// verify refuses a larger value. Stated here so a misconfiguration is a startup error
+	// rather than a construction failure further down.
+	cfg.TokenMaxSkew = durationOr("REFERENCE_TOKEN_MAX_SKEW", 30*time.Second, &problems)
+	if cfg.TokenMaxSkew > 60*time.Second {
+		problems = append(problems, fmt.Errorf(
+			"REFERENCE_TOKEN_MAX_SKEW is %s; STD-IAM-002 §3.5 caps clock skew at 60s", cfg.TokenMaxSkew))
+	}
 
 	cfg.MaxProjectionAge = durationOr("REFERENCE_MAX_PROJECTION_AGE", 60*time.Second, &problems)
 	cfg.AuthorityTimeout = durationOr("REFERENCE_AUTHORITY_TIMEOUT", 2*time.Second, &problems)

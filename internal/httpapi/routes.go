@@ -3,10 +3,12 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/anshacerbia2/foundation-platform/event"
 	"github.com/anshacerbia2/foundation-platform/id"
@@ -45,10 +47,29 @@ func Operations() []Operation {
 	return out
 }
 
+// Deliveries is what the routes need from the projection: apply an event, and report how
+// stale the answer is. An interface for the same reason the enforcer takes one -- the routes
+// can then be tested without a database, and the test that matters most here is the one
+// asserting a route cannot be mounted unauthenticated.
+type Deliveries interface {
+	Apply(ctx context.Context, envelope event.Envelope) (projection.Outcome, error)
+	Age(ctx context.Context) (time.Duration, error)
+}
+
 type Config struct {
-	Projector *projection.Projector
+	Projector Deliveries
 	Enforcer  *Enforcer
 	Telemetry *observability.Telemetry
+
+	// Delivery and Caller are the two authentication middlewares, kept separate because the
+	// two authorities are different: a workload that may apply events, and a principal that
+	// may ask whether it can act. One middleware over both would let any caller of an
+	// operation forge a revocation, or forge its absence by replaying an older version.
+	//
+	// Both are required. A nil middleware here would mount the route unauthenticated, and an
+	// unauthenticated intake is a projection anyone can write.
+	Delivery func(http.Handler) http.Handler
+	Caller   func(http.Handler) http.Handler
 }
 
 // Surface separates the probes from everything else, the way organization-control does.
@@ -66,6 +87,15 @@ func Routes(cfg Config) (*Surface, error) {
 	}
 	if cfg.Enforcer == nil {
 		return nil, errors.New("httpapi: an enforcer is required")
+	}
+	// Refused at construction rather than defaulted to a pass-through. A missing middleware
+	// is the one configuration mistake that produces no symptom: everything works, and
+	// nothing is authenticated.
+	if cfg.Delivery == nil {
+		return nil, errors.New("httpapi: delivery authentication is required; an unauthenticated intake is a projection anyone can write")
+	}
+	if cfg.Caller == nil {
+		return nil, errors.New("httpapi: caller authentication is required")
 	}
 
 	probes := http.NewServeMux()
@@ -91,7 +121,7 @@ func Routes(cfg Config) (*Surface, error) {
 
 	// The intake. A broker adapter posts an envelope here; the transport is deliberately
 	// boring so the properties under test are the consumer's, not the transport's.
-	api.HandleFunc("POST /v1/deliveries", func(w http.ResponseWriter, r *http.Request) {
+	api.Handle("POST /v1/deliveries", cfg.Delivery(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxDeliveryBody))
 		decoder.DisallowUnknownFields()
@@ -126,13 +156,15 @@ func Routes(cfg Config) (*Surface, error) {
 			"superseded": outcome.Superseded,
 			"version":    outcome.Record.Version,
 		})
-	})
+	})))
 
 	for _, operation := range operations {
 		if _, err := PolicyFor(operation.Class); err != nil {
 			return nil, fmt.Errorf("httpapi: route %s %s: %w", operation.Method, operation.Pattern, err)
 		}
-		api.HandleFunc(operation.Method+" "+operation.Pattern, protected(cfg.Enforcer, operation))
+		// The role is chosen here, beside the security class, so both properties of a route
+		// are stated in one place and neither can be inherited from a default.
+		api.Handle(operation.Method+" "+operation.Pattern, cfg.Caller(protected(cfg.Enforcer, operation)))
 	}
 
 	return &Surface{Probes: probes, API: api}, nil
