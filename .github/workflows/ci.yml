@@ -1,0 +1,137 @@
+name: ci
+
+# Every check here exists because a rule somewhere requires it, and the rule is named on the
+# step. A gate whose reason is not written down is a gate someone deletes to make a build green.
+#
+# This repository exists to produce evidence, so its gates are the evidence's warrant: a claim
+# that "duplicate delivery is safe" or "out-of-order delivery is harmless" is worth nothing if
+# the only place it was ever checked is one developer's machine.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  # A minor version, not a patch: the patch a runner resolves is a testing detail, and pinning
+  # it would turn every Go security release into a manual bump.
+  GO_VERSION: "1.26"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    # A disposable PostgreSQL. The two properties this repository exists to prove are properties
+    # of a database under concurrent writes -- a deduplication table and a conditional upsert --
+    # and no fake can answer for either.
+    services:
+      postgres:
+        # Pinned by digest rather than by tag, so a run six months from now tests the same
+        # server. PostgreSQL 17 is what foundation-platform is verified against.
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_USER: reference
+          POSTGRES_PASSWORD: reference
+          POSTGRES_DB: reference_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reference"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The owner is `reference`, not `postgres`. Deliberately different from the local
+      # development owner: organization-control had a suite that passed locally and failed here
+      # purely because a test had hardcoded the owner's name, and nothing local could catch it.
+      REFERENCE_MIGRATION_DATABASE_URL: postgres://reference:reference@localhost:5432/reference_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://reference:reference@localhost:5432/reference_test?sslmode=disable
+
+      # Turns a skipped integration suite into a failure. Without it, a service container that
+      # never came up would leave every projection assertion unrun and the build green -- which
+      # is indistinguishable from having proven the properties this repository is named for.
+      REQUIRE_INTEGRATION: "1"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # foundation-platform is pinned to a tag, never a branch or a pseudo-version. This
+      # repository's whole evidentiary value is that it is built the way a consuming squad would
+      # build it -- against the published substrate. A pseudo-version means it is being tested
+      # against something no squad can obtain.
+      - name: foundation-platform is pinned to a released version
+        run: |
+          version=$(go list -m -f '{{.Version}}' github.com/anshacerbia2/foundation-platform)
+          echo "foundation-platform ${version}"
+          case "$version" in
+            v0.0.0-*)
+              echo "::error::foundation-platform resolves to a pseudo-version (${version}); pin a tag"
+              exit 1
+              ;;
+          esac
+
+      - name: dependencies are tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go mod tidy changed go.mod or go.sum; commit the result"
+            exit 1
+          fi
+
+      # The platform schema this consumer depends on, then its own projection schema. Applied by
+      # the same command a deployment runs, so a migration that only works when a human runs it
+      # by hand fails here instead of on a release day.
+      - name: apply the schema
+        run: go run ./cmd/foundation-reference-migrate
+
+      # -race because the properties under test are properties under concurrency: a
+      # deduplication that holds only when deliveries arrive one at a time has not been tested.
+      - name: test
+        run: go test ./... -race -count=1
+
+      # The claim that out-of-order delivery is harmless rests on one WHERE clause, so the gate
+      # asserts the test would notice its removal. A test that passes with the guard gone is a
+      # test that proves nothing, and this is the cheapest possible mutation check.
+      - name: the monotonicity guard is load-bearing
+        run: |
+          file=internal/projection/projection.go
+          cp "$file" "$file.orig"
+          sed -i 's/WHERE excluded.version > membership.version/WHERE TRUE/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the guard was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/projection -run TestOutOfOrderDeliveryIsHarmless -count=1; then
+            echo "::error::the suite passed with the monotonicity guard removed, so it does not test it"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the guard is load-bearing: removing it fails TestOutOfOrderDeliveryIsHarmless"
+          mv "$file.orig" "$file"
