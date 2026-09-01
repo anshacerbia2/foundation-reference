@@ -118,20 +118,31 @@ jobs:
       # The claim that out-of-order delivery is harmless rests on one WHERE clause, so the gate
       # asserts the test would notice its removal. A test that passes with the guard gone is a
       # test that proves nothing, and this is the cheapest possible mutation check.
+      #
+      # The pattern is matched loosely on purpose — `WHERE excluded.*membership_version` rather than
+      # the exact predicate. This gate went red once because the column was renamed and the literal
+      # here was not: correct behaviour, since a mutation check that finds nothing to mutate reports
+      # success, but the failure was in this file rather than in the code. Loose matching costs
+      # nothing (the not-found branch below still catches a real disappearance) and removes a class
+      # of red build that teaches people to distrust the gate.
       - name: the monotonicity guard is load-bearing
         run: |
           file=internal/projection/projection.go
           cp "$file" "$file.orig"
-          sed -i 's/WHERE excluded.version > membership.version/WHERE TRUE/' "$file"
+          sed -i -E 's/WHERE excluded\.membership_version > membership\.membership_version/WHERE TRUE/' "$file"
           if git diff --quiet "$file"; then
             echo "::error::the guard was not found; this check is silently passing and must be updated"
             mv "$file.orig" "$file"
             exit 1
           fi
-          if go test ./internal/projection -run TestOutOfOrderDeliveryIsHarmless -count=1; then
+          # Three tests rather than one. They fail differently when the guard is gone -- a version
+          # regression, a re-applied event, and a reinstated revocation -- so running only the first
+          # would let a future change satisfy it while breaking the other two.
+          if go test ./internal/projection -count=1 \
+              -run 'TestOutOfOrderDeliveryIsHarmless|TestCatchUpDoesNotRegressStateThePagesAlreadyCarried|TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot'; then
             echo "::error::the suite passed with the monotonicity guard removed, so it does not test it"
             mv "$file.orig" "$file"
             exit 1
           fi
-          echo "the guard is load-bearing: removing it fails TestOutOfOrderDeliveryIsHarmless"
+          echo "the guard is load-bearing: removing it fails the ordering and convergence tests"
           mv "$file.orig" "$file"

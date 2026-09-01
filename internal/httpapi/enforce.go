@@ -215,6 +215,21 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 // Composed here rather than in the producer deliberately: the producer cannot see which operation is
 // being authorised, and the same lag is acceptable for a directory read and unacceptable for a
 // payroll one.
+//
+// # What this model does NOT yet cover
+//
+// The verdict uses the consumer's apply age, the producer's oldest owed delivery, and whether the
+// producer could be reached. It does NOT use the two marks -- highest committed and applied -- as
+// decision inputs, and the claim must stay narrow for that reason.
+//
+// It is defensible for the transport in place today, where a delivery is an HTTP call this consumer
+// acknowledges only after it has applied the event: published and applied are the same instant, so
+// the producer's unpublished pool already accounts for everything not yet in the projection.
+//
+// It stops being defensible the moment a broker is introduced. Then published means "handed to the
+// broker", the producer's pool empties while the consumer is still behind, and applied progress
+// becomes load-bearing: the verdict will need the gap between HighestCommittedMark and this
+// consumer's AppliedMark, which is why both are already carried and reported.
 func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, ageErr error) (bool, string) {
 	if policy.MaxStale == 0 {
 		// A class tolerating nothing does not need a measurement to refuse. Stated first so the
@@ -248,7 +263,19 @@ func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, 
 	// The producer observed its oldest owed delivery at an instant that has since passed, so the age
 	// it reported has grown by the time since. Ignoring that would let a cached answer certify
 	// freshness it can no longer support.
-	owed := facts.OldestUnpublishedAge + e.now().UTC().Sub(facts.ObservedAt)
+	//
+	// The elapsed term is measured from ReadAt, not from ObservedAt, and the difference is a
+	// correctness one rather than a rounding one. ObservedAt is on the PRODUCER's clock; subtracting
+	// it from this consumer's clock mixes two domains, and a consumer whose clock is behind the
+	// producer's gets a smaller elapsed term -- understating the backlog and serving data it should
+	// have refused. Worse, a producer clock a few minutes ahead makes the term negative and the
+	// answer looks fresher the longer it sits.
+	//
+	// ReadAt is stamped by the frontier client on this side, so both ends of this subtraction are the
+	// consumer's own clock. The producer's two facts (age and observed_at) are computed against one
+	// database clock, so the age it reports is internally consistent; all this side adds is how long
+	// it has held the answer.
+	owed := facts.OldestUnpublishedAge + facts.Age(e.now().UTC())
 	if owed > policy.MaxStale {
 		return true, fmt.Sprintf("the producer has owed a delivery for %s, past this class's %s bound",
 			owed.Round(time.Millisecond), policy.MaxStale)

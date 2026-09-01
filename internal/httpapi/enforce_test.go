@@ -437,3 +437,63 @@ func TestACachedFrontierAgesRatherThanFreezing(t *testing.T) {
 func contains(haystack, needle string) bool {
 	return len(haystack) >= len(needle) && strings.Contains(haystack, needle)
 }
+
+// TestFreshnessDoesNotMixClockDomains is the bug the principal review caught, as an assertion.
+//
+// The elapsed term was measured as consumerNow - producer.ObservedAt, which straddles two clocks. A
+// producer clock running ahead makes that term negative, so the answer looks FRESHER the longer the
+// consumer holds it -- and the consumer serves data it should have refused.
+//
+// Here the producer's clock is ten minutes ahead, and the consumer read the answer 40 seconds ago
+// reporting a 40-second backlog: 80 seconds against a 60-second window, so stale. The verdict must
+// not depend on the producer's clock at all.
+func TestFreshnessDoesNotMixClockDomains(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+
+	now := time.Now().UTC()
+	skewed := stubFrontier{facts: frontier.Facts{
+		OldestUnpublishedAge: 40 * time.Second,
+		Unpublished:          true,
+		ObservedAt:           now.Add(10 * time.Minute), // producer clock ahead
+		ReadAt:               now.Add(-40 * time.Second),
+	}}
+
+	decision, err := enforcerWith(t, active, nil, skewed).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Stale {
+		t.Error("a producer clock running ahead made an 80s backlog look inside a 60s window")
+	}
+}
+
+// TestABehindConsumerClockDoesNotUnderstateTheBacklog is the same defect from the other side: with
+// the old formula a consumer clock running behind shrinks the elapsed term, and the understatement
+// grows with the skew.
+func TestABehindConsumerClockDoesNotUnderstateTheBacklog(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+
+	now := time.Now().UTC()
+	skewed := stubFrontier{facts: frontier.Facts{
+		OldestUnpublishedAge: 55 * time.Second,
+		Unpublished:          true,
+		ObservedAt:           now.Add(5 * time.Minute),
+		ReadAt:               now.Add(-30 * time.Second),
+	}}
+
+	decision, err := enforcerWith(t, active, nil, skewed).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Stale {
+		t.Error("55s owed plus 30s held was treated as inside a 60s window")
+	}
+}
