@@ -10,20 +10,21 @@
 // This version projects status, seeded by a snapshot, so absence means no positive authority and the
 // answer is a refusal.
 //
-// # Two orderings, and only one of them is the version
+// # One row per membership, and the question asked at the read
 //
-// `membership_version` is monotonic per membership and says nothing across memberships. A principal
-// may hold membership A, have it revoked at version 5, and be granted membership B at version 1 in
-// the same tenant: comparing 1 against 5 discards the grant and leaves the revocation standing
-// forever.
+// The authority permits several active memberships for one principal in one tenant -- one tenant-wide
+// and one per workspace, by its own unique constraint. Keying this table by (tenant_id, principal_id)
+// collapsed them, so the second event overwrote the first and revoking either reported the principal
+// as revoked across the tenant while they still held the other.
 //
-// So the rule is explicit:
+// One row per membership instead, ordered by that membership's own version, which the authority
+// increments under a row lock. Nothing compares versions across memberships, which removes rather
+// than solves the ordering hazard: the previous shape needed the producer's stream position as a
+// tiebreak, and that position is ALLOCATION order -- the outbox takes its sequence before the
+// transaction commits, so two transitions can commit in the opposite order to their numbers.
 //
-//	same membership_id      -> compare membership_version
-//	different membership_id -> compare the producer's stream position
-//
-// The stream position is the authority's own commit order, which is the only total order both sides
-// agree on. TestANewMembershipIsNotOlderThanTheRevokedOneItReplaces is the assertion.
+// The cross-membership question moves to the read, where it belongs: does an active membership exist
+// for this pair. That is answerable from whatever rows have arrived, in any order.
 //
 // # Duplicate delivery
 //
@@ -94,6 +95,10 @@ type Payload struct {
 	PrincipalID  id.UUID `json:"principal_id"`
 	Version      int64   `json:"membership_version"`
 
+	// WorkspaceID is null for a tenant-wide membership. Read because it is what makes several active
+	// memberships legal for one pair, so a projection that dropped it could not explain its own rows.
+	WorkspaceID *id.UUID `json:"workspace_id"`
+
 	// Status as the producer sees it. Read but not trusted over the event type: a granted event
 	// carrying "revoked" is a contradiction, and the type is the thing the dispatcher routed on.
 	Status string `json:"membership_status"`
@@ -101,11 +106,22 @@ type Payload struct {
 	TenantSecurityVersion int64 `json:"tenant_security_version"`
 }
 
+// workspace renders the optional workspace for the database, where nil must be NULL rather than the
+// zero UUID: the authority's own constraint folds NULL into the tenant-wide case, and a zero UUID
+// would be a workspace that does not exist.
+func (p Payload) workspace() any {
+	if p.WorkspaceID == nil || p.WorkspaceID.IsNil() {
+		return nil
+	}
+	return p.WorkspaceID.String()
+}
+
 // Record is what an enforcement decision reads.
 type Record struct {
 	MembershipID          id.UUID
 	TenantID              id.UUID
 	PrincipalID           id.UUID
+	WorkspaceID           *id.UUID
 	Status                Status
 	Version               int64
 	TenantSecurityVersion int64
@@ -158,32 +174,31 @@ func New(pool *db.Pool, consumer string) (*Projector, error) {
 	return &Projector{pool: pool, consumer: consumer, now: time.Now}, nil
 }
 
-// The ordering rule, in SQL, and it is the whole reason broker ordering is not a correctness
-// requirement.
+// The ordering rule, in SQL: one row per membership, ordered by that membership's own version.
 //
-// The WHERE clause admits the incoming row when either:
+// This is what keying by membership removed rather than solved. With one row per (tenant, principal),
+// a grant for a replacement membership carried a lower version than the revocation it replaced, and
+// the only available tiebreak was the producer's stream position -- which is ALLOCATION order, not
+// commit order, because the outbox takes its sequence before the transaction commits. Two transitions
+// could therefore commit in the opposite order to their numbers, and the projection would settle on
+// the wrong one.
 //
-//   - it names the membership already stored and carries a higher membership_version, or
-//   - it names a different membership and was committed later in the producer's stream.
-//
-// The second half is what lets a fresh grant replace a revoked membership. Written as one predicate
-// rather than two statements because a read-then-write would race two deliveries for the same pair.
+// Keyed by membership, no comparison crosses memberships at all: each row advances only on its own
+// version, which the authority increments under a row lock. The cross-membership question moves to
+// the read, where it belongs -- "does an active membership exist for this pair" -- and is answered
+// from whatever rows have arrived, in any order.
 const upsertStatement = `INSERT INTO projection.membership
-    (tenant_id, principal_id, membership_id, membership_status, membership_version,
+    (membership_id, tenant_id, principal_id, workspace_id, membership_status, membership_version,
      applied_mark, tenant_security_version, applied_at, event_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (tenant_id, principal_id) DO UPDATE
-   SET membership_id           = excluded.membership_id,
-       membership_status       = excluded.membership_status,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (membership_id) DO UPDATE
+   SET membership_status       = excluded.membership_status,
        membership_version      = excluded.membership_version,
        applied_mark            = excluded.applied_mark,
        tenant_security_version = excluded.tenant_security_version,
        applied_at              = excluded.applied_at,
        event_id                = excluded.event_id
- WHERE (excluded.membership_id = membership.membership_id
-        AND excluded.membership_version > membership.membership_version)
-    OR (excluded.membership_id <> membership.membership_id
-        AND excluded.applied_mark > membership.applied_mark)`
+ WHERE excluded.membership_version > membership.membership_version`
 
 // Advancing inserts when absent so a consumer that has applied an event but not bootstrapped still
 // has a position -- and its NULL snapshot_mark is what refuses it authority.
@@ -230,8 +245,8 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 
 		appliedAt := p.now().UTC()
 		tag, err := tx.Exec(ctx, upsertStatement,
-			payload.TenantID.String(), payload.PrincipalID.String(), payload.MembershipID.String(),
-			string(status), payload.Version, envelope.StreamPosition,
+			payload.MembershipID.String(), payload.TenantID.String(), payload.PrincipalID.String(),
+			payload.workspace(), string(status), payload.Version, envelope.StreamPosition,
 			payload.TenantSecurityVersion, appliedAt, envelope.ID.String())
 		if err != nil {
 			return fmt.Errorf("projection: applying %s: %w", envelope.ID, err)
@@ -270,48 +285,79 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 	return outcome, nil
 }
 
-const lookupStatement = `SELECT membership_id, membership_status, membership_version,
-       tenant_security_version, applied_mark, applied_at
-  FROM projection.membership WHERE tenant_id = $1 AND principal_id = $2`
+// ErrWithdrawn means rows exist for this pair and none of them is active. Distinct from
+// ErrNotProjected on purpose: both refuse, and only one of them means the consumer has actually seen
+// this principal. An operator reading a refusal needs to know which.
+var ErrWithdrawn = errors.New("projection: this principal holds no active membership in this tenant")
 
-// Lookup answers from the projection alone, keyed by the pair enforcement asks about.
+// Enforcement asks one question -- does an active membership exist for this pair -- and it is asked as
+// EXISTS rather than as "read the row and check its status", because there may be several rows and
+// only one of them needs to be active.
 //
-// ErrNotProjected now means "no positive authority is projected for this pair" rather than "no
-// revocation is recorded". That is the difference between an enforcement answer and the absence of
-// bad news.
+// The newest active one is returned when several are: the version and mark are reported to the caller,
+// and reporting the oldest would understate how current the answer is.
+const activeStatement = `SELECT membership_id, workspace_id, membership_version,
+       tenant_security_version, applied_mark, applied_at
+  FROM projection.membership
+ WHERE tenant_id = $1 AND principal_id = $2 AND membership_status = 'active'
+ ORDER BY applied_mark DESC
+ LIMIT 1`
+
+const anyStatement = `SELECT count(*) FROM projection.membership
+ WHERE tenant_id = $1 AND principal_id = $2`
+
+// Lookup answers whether this principal holds an active membership in this tenant.
+//
+// Three outcomes, and the caller needs all three apart:
+//
+//	an active membership   -> the record, nil
+//	rows but none active   -> ErrWithdrawn
+//	no rows at all         -> ErrNotProjected
 func (p *Projector) Lookup(ctx context.Context, tenantID, principalID id.UUID) (Record, error) {
-	record := Record{TenantID: tenantID, PrincipalID: principalID}
+	record := Record{TenantID: tenantID, PrincipalID: principalID, Status: Active}
 
 	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-		// Query and Next rather than QueryRow: absence is an expected answer, and telling it apart
-		// from a scan failure through QueryRow means comparing against the driver's sentinel. "No
-		// authority is projected" and "the read broke" must reach the caller as different things —
-		// the first is a refusal, the second is never fail-open eligible.
-		rows, err := tx.Query(ctx, lookupStatement, tenantID.String(), principalID.String())
+		rows, err := tx.Query(ctx, activeStatement, tenantID.String(), principalID.String())
 		if err != nil {
 			return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
 		}
 		defer rows.Close()
 
-		if !rows.Next() {
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
+		if rows.Next() {
+			var membership string
+			var workspace *string
+			if err := rows.Scan(&membership, &workspace, &record.Version,
+				&record.TenantSecurityVersion, &record.AppliedMark, &record.AppliedAt); err != nil {
+				return fmt.Errorf("projection: scanning (%s, %s): %w", tenantID, principalID, err)
 			}
-			return ErrNotProjected
+			parsed, err := id.Parse(membership)
+			if err != nil {
+				return fmt.Errorf("projection: stored membership_id is not a UUID: %w", err)
+			}
+			record.MembershipID = parsed
+			if workspace != nil {
+				scoped, err := id.Parse(*workspace)
+				if err != nil {
+					return fmt.Errorf("projection: stored workspace_id is not a UUID: %w", err)
+				}
+				record.WorkspaceID = &scoped
+			}
+			return nil
 		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
+		}
+		rows.Close()
 
-		var membership, status string
-		if err := rows.Scan(&membership, &status, &record.Version,
-			&record.TenantSecurityVersion, &record.AppliedMark, &record.AppliedAt); err != nil {
-			return fmt.Errorf("projection: scanning (%s, %s): %w", tenantID, principalID, err)
+		// No active membership. Whether this pair is known at all decides which refusal it is.
+		var seen int
+		if err := tx.QueryRow(ctx, anyStatement, tenantID.String(), principalID.String()).Scan(&seen); err != nil {
+			return fmt.Errorf("projection: counting (%s, %s): %w", tenantID, principalID, err)
 		}
-		parsed, err := id.Parse(membership)
-		if err != nil {
-			return fmt.Errorf("projection: stored membership_id is not a UUID: %w", err)
+		if seen > 0 {
+			return ErrWithdrawn
 		}
-		record.MembershipID = parsed
-		record.Status = Status(status)
-		return nil
+		return ErrNotProjected
 	})
 	if err != nil {
 		return Record{}, err
@@ -346,18 +392,17 @@ func (p *Projector) Position(ctx context.Context) (Position, error) {
 }
 
 const seedStatement = `INSERT INTO projection.membership
-    (tenant_id, principal_id, membership_id, membership_status, membership_version,
+    (membership_id, tenant_id, principal_id, workspace_id, membership_status, membership_version,
      applied_mark, tenant_security_version, applied_at, event_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (tenant_id, principal_id) DO UPDATE
-   SET membership_id           = excluded.membership_id,
-       membership_status       = excluded.membership_status,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (membership_id) DO UPDATE
+   SET membership_status       = excluded.membership_status,
        membership_version      = excluded.membership_version,
        applied_mark            = excluded.applied_mark,
        tenant_security_version = excluded.tenant_security_version,
        applied_at              = excluded.applied_at,
        event_id                = excluded.event_id
- WHERE excluded.applied_mark > membership.applied_mark`
+ WHERE excluded.membership_version > membership.membership_version`
 
 // Recording the snapshot mark inserts when absent, because a consumer's watermark row appears when
 // it first applies something or first bootstraps, whichever happens first — and a consumer may
@@ -375,9 +420,17 @@ type Seeded struct {
 	MembershipID          id.UUID
 	TenantID              id.UUID
 	PrincipalID           id.UUID
+	WorkspaceID           *id.UUID
 	Status                Status
 	Version               int64
 	TenantSecurityVersion int64
+}
+
+func (s Seeded) workspace() any {
+	if s.WorkspaceID == nil || s.WorkspaceID.IsNil() {
+		return nil
+	}
+	return s.WorkspaceID.String()
 }
 
 // Seed applies one snapshot page at the snapshot's mark, and records the mark when the page is the
@@ -400,9 +453,9 @@ func (p *Projector) Seed(ctx context.Context, rows []Seeded, mark int64, final b
 				return fmt.Errorf("%w: a snapshot row is missing an identifier", ErrMalformed)
 			}
 			if _, err := tx.Exec(ctx, seedStatement,
-				row.TenantID.String(), row.PrincipalID.String(), row.MembershipID.String(),
-				string(row.Status), row.Version, mark, row.TenantSecurityVersion, at,
-				row.MembershipID.String()); err != nil {
+				row.MembershipID.String(), row.TenantID.String(), row.PrincipalID.String(),
+				row.workspace(), string(row.Status), row.Version, mark,
+				row.TenantSecurityVersion, at, row.MembershipID.String()); err != nil {
 				return fmt.Errorf("projection: seeding %s: %w", row.MembershipID, err)
 			}
 		}
@@ -463,4 +516,62 @@ func (p *Projector) Age(ctx context.Context) (time.Duration, error) {
 		age = 0
 	}
 	return age, nil
+}
+
+const byMembershipStatement = `SELECT tenant_id, principal_id, workspace_id, membership_status,
+       membership_version, tenant_security_version, applied_mark, applied_at
+  FROM projection.membership WHERE membership_id = $1`
+
+// LookupMembership reads one membership by identity, whatever its status.
+//
+// Not the enforcement read: enforcement asks whether an active membership exists for a pair, and a
+// caller that fetched a membership and inspected its status would be answering a narrower question
+// than the one it has. This exists for triage -- joining a refusal to the row and the event that
+// produced it -- and for tests that assert what a delivery did to a specific membership.
+func (p *Projector) LookupMembership(ctx context.Context, membershipID id.UUID) (Record, error) {
+	record := Record{MembershipID: membershipID}
+
+	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		rows, err := tx.Query(ctx, byMembershipStatement, membershipID.String())
+		if err != nil {
+			return fmt.Errorf("projection: reading %s: %w", membershipID, err)
+		}
+		defer rows.Close()
+
+		if !rows.Next() {
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("projection: reading %s: %w", membershipID, err)
+			}
+			return ErrNotProjected
+		}
+
+		var tenant, principal, status string
+		var workspace *string
+		if err := rows.Scan(&tenant, &principal, &workspace, &status, &record.Version,
+			&record.TenantSecurityVersion, &record.AppliedMark, &record.AppliedAt); err != nil {
+			return fmt.Errorf("projection: scanning %s: %w", membershipID, err)
+		}
+
+		parsedTenant, err := id.Parse(tenant)
+		if err != nil {
+			return fmt.Errorf("projection: stored tenant_id is not a UUID: %w", err)
+		}
+		parsedPrincipal, err := id.Parse(principal)
+		if err != nil {
+			return fmt.Errorf("projection: stored principal_id is not a UUID: %w", err)
+		}
+		record.TenantID, record.PrincipalID, record.Status = parsedTenant, parsedPrincipal, Status(status)
+		if workspace != nil {
+			scoped, err := id.Parse(*workspace)
+			if err != nil {
+				return fmt.Errorf("projection: stored workspace_id is not a UUID: %w", err)
+			}
+			record.WorkspaceID = &scoped
+		}
+		return nil
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return record, nil
 }

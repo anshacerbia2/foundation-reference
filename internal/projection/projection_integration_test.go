@@ -129,7 +129,7 @@ func TestApplyingARevocationProjectsIt(t *testing.T) {
 			outcome.Applied, outcome.Duplicate, outcome.Superseded)
 	}
 
-	record, err := projector.Lookup(ctx, s.tenant, s.principal)
+	record, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestOutOfOrderDeliveryIsHarmless(t *testing.T) {
 			late.Applied, late.Duplicate, late.Superseded)
 	}
 
-	record, err := projector.Lookup(ctx, s.tenant, s.principal)
+	record, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestANewerDeliveryAdvancesTheVersion(t *testing.T) {
 		t.Error("a newer version did not apply")
 	}
 
-	record, err := projector.Lookup(ctx, s.tenant, s.principal)
+	record, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestANewMembershipIsNotOlderThanTheRevokedOneItReplaces(t *testing.T) {
 			outcome.Applied, outcome.Superseded)
 	}
 
-	record, err := projector.Lookup(ctx, first.tenant, first.principal)
+	record, err := projector.LookupMembership(ctx, replacement.membership)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -355,36 +355,79 @@ func TestANewMembershipIsNotOlderThanTheRevokedOneItReplaces(t *testing.T) {
 	}
 }
 
-// TestAnOlderEventForADifferentMembershipIsSuperseded is the other direction, so the rule is not
-// simply "a different membership always wins".
-func TestAnOlderEventForADifferentMembershipIsSuperseded(t *testing.T) {
+// TestTwoMembershipsForOnePairCoexist is the cardinality the authority actually permits, and the
+// reason this projection is keyed by membership.
+//
+// Its own constraint is unique on (principal_id, tenant_id, COALESCE(workspace_id, tenant_id)) where
+// status='active', so a principal may hold one tenant-wide membership and one per workspace. Keyed by
+// the pair, the second event overwrote the first and revoking either reported the principal as
+// revoked across the tenant while they still held the other.
+func TestTwoMembershipsForOnePairCoexist(t *testing.T) {
 	projector, _, ctx := fixture(t)
-	current := newSubject(t)
 
-	grant := granted(t, current, 2)
-	grant.StreamPosition = 900
-	if _, err := projector.Apply(ctx, grant); err != nil {
-		t.Fatalf("granting the current membership: %v", err)
+	tenantWide := newSubject(t)
+	scoped := tenantWide
+	scoped.membership = newID(t)
+	workspace := newID(t)
+
+	if _, err := projector.Apply(ctx, granted(t, tenantWide, 1)); err != nil {
+		t.Fatalf("granting the tenant-wide membership: %v", err)
+	}
+	scopedGrant := granted(t, scoped, 1)
+	scopedGrant.StreamPosition = 2
+	if _, err := projector.Apply(ctx, withWorkspace(t, scopedGrant, workspace)); err != nil {
+		t.Fatalf("granting the workspace membership: %v", err)
 	}
 
-	stale := current
-	stale.membership = newID(t)
-	late := revoked(t, stale, 9)
-	late.StreamPosition = 800 // committed before the grant above
+	// Both rows exist, which the previous shape could not represent.
+	for _, m := range []id.UUID{tenantWide.membership, scoped.membership} {
+		if _, err := projector.LookupMembership(ctx, m); err != nil {
+			t.Fatalf("membership %s is not projected: %v", m, err)
+		}
+	}
 
-	outcome, err := projector.Apply(ctx, late)
+	// Revoking one leaves the principal with the other, and enforcement says so.
+	revocation := revoked(t, scoped, 2)
+	revocation.StreamPosition = 3
+	if _, err := projector.Apply(ctx, withWorkspace(t, revocation, workspace)); err != nil {
+		t.Fatalf("revoking the workspace membership: %v", err)
+	}
+
+	active, err := projector.Lookup(ctx, tenantWide.tenant, tenantWide.principal)
 	if err != nil {
-		t.Fatalf("applying the earlier event: %v", err)
+		t.Fatalf("revoking one membership withdrew the principal entirely: %v", err)
 	}
-	if !outcome.Superseded {
-		t.Errorf("an event committed earlier for a replaced membership was applied: %+v", outcome)
+	if active.MembershipID != tenantWide.membership {
+		t.Errorf("the active membership is %s, want the tenant-wide %s",
+			active.MembershipID, tenantWide.membership)
 	}
 
-	record, err := projector.Lookup(ctx, current.tenant, current.principal)
+	// And revoking the second one does withdraw them.
+	last := revoked(t, tenantWide, 2)
+	last.StreamPosition = 4
+	if _, err := projector.Apply(ctx, last); err != nil {
+		t.Fatalf("revoking the tenant-wide membership: %v", err)
+	}
+	if _, err := projector.Lookup(ctx, tenantWide.tenant, tenantWide.principal); !errors.Is(err, projection.ErrWithdrawn) {
+		t.Errorf("Lookup returned %v after both memberships were revoked, want ErrWithdrawn", err)
+	}
+}
+
+// withWorkspace rewrites the payload to carry a workspace, the way a workspace-scoped membership
+// event does.
+func withWorkspace(t *testing.T, envelope event.Envelope, workspace id.UUID) event.Envelope {
+	t.Helper()
+
+	var payload map[string]any
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decoding a fixture payload: %v", err)
+	}
+	payload["workspace_id"] = workspace.String()
+
+	encoded, err := json.Marshal(payload)
 	if err != nil {
-		t.Fatalf("Lookup: %v", err)
+		t.Fatalf("encoding a fixture payload: %v", err)
 	}
-	if record.Status != projection.Active {
-		t.Errorf("status = %s; an earlier event for a different membership overwrote the current one", record.Status)
-	}
+	envelope.Data = encoded
+	return envelope
 }

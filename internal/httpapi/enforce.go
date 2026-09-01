@@ -115,10 +115,13 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 
 	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
-	case err == nil && record.Active():
-		// Positive authority, present rather than inferred. This is the answer that was impossible
-		// while the projection held only revocations: absence had to mean permission, so "allowed"
-		// meant "no bad news has arrived".
+	case err == nil:
+		// An active membership exists for this pair — positive authority, present rather than
+		// inferred. Lookup answers EXISTS-active rather than returning a row to inspect, because the
+		// authority permits several memberships per pair and only one of them needs to be active.
+		//
+		// This is the answer that was impossible while the projection held only revocations, where
+		// absence had to mean permission and "allowed" meant "no bad news has arrived".
 		//
 		// Freshness still decides whether the answer may be used, because an active row can be one
 		// the revocation has not reached yet.
@@ -144,15 +147,17 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 			Age:    age,
 		}, nil
 
-	case err == nil:
-		// A revocation that has been applied is enforced regardless of class or freshness.
-		// This is the property Proof A exists to demonstrate.
-		// Projected and not active: suspended or revoked. Refused regardless of class and regardless
-		// of freshness, because a withdrawal that has arrived is not made less true by being old.
-		// This is the property Proof A exists to demonstrate.
+	case errors.Is(err, projection.ErrWithdrawn):
+		// Rows exist for this pair and none of them is active: every membership this principal held
+		// in this tenant is suspended or revoked. Refused regardless of class and regardless of
+		// freshness, because a withdrawal that has arrived is not made less true by being old. This
+		// is the property Proof A exists to demonstrate.
+		//
+		// Kept apart from ErrNotProjected below, which also refuses: an operator reading a refusal
+		// needs to know whether this consumer has ever seen the principal at all.
 		return Decision{
 			Allow:  false,
-			Reason: fmt.Sprintf("membership is %s at version %d", record.Status, record.Version),
+			Reason: "this principal holds no active membership in this tenant",
 			Stale:  stale,
 			Age:    age,
 		}, nil

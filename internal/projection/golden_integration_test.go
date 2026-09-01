@@ -85,7 +85,7 @@ func TestTheGoldenEnvelopeIsAppliedAsTheProducerSentIt(t *testing.T) {
 		t.Fatal("the golden payload decoded with a nil tenant or principal")
 	}
 
-	applied, err := projector.Lookup(ctx, payload.TenantID, payload.PrincipalID)
+	applied, err := projector.LookupMembership(ctx, payload.MembershipID)
 	if err != nil {
 		t.Fatalf("the event applied but the pair it names cannot be read back: %v", err)
 	}

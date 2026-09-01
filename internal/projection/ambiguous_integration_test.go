@@ -42,7 +42,7 @@ func TestAnAcknowledgementLostAfterCommitIsSafeToRetry(t *testing.T) {
 		t.Fatal("the first delivery did not apply, so the ambiguity being tested never arose")
 	}
 
-	before, err := projector.Lookup(ctx, s.tenant, s.principal)
+	before, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("reading the state the first delivery produced: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestAnAcknowledgementLostAfterCommitIsSafeToRetry(t *testing.T) {
 		t.Error("the retry applied the effect a second time")
 	}
 
-	after, err := projector.Lookup(ctx, s.tenant, s.principal)
+	after, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("reading the state after the retry: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestARetryAfterCommitIsSafeEvenWhenAnotherEventLanded(t *testing.T) {
 		t.Errorf("the retry reported duplicate = %v; want true", retried.Duplicate)
 	}
 
-	record, err := projector.Lookup(ctx, s.tenant, s.principal)
+	record, err := projector.LookupMembership(ctx, s.membership)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}

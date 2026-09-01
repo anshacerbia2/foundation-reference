@@ -67,10 +67,10 @@ func enforcer(t *testing.T, p httpapi.Projection, a httpapi.Authority) *httpapi.
 // class and regardless of freshness — freshness only decides what happens when the answer is
 // absent, never when it is present.
 func TestAnAppliedRevocationIsEnforcedForEveryClass(t *testing.T) {
-	stub := stubProjection{
-		age:    time.Second,
-		record: projection.Record{MembershipID: membership(t), Status: projection.Revoked, Version: 7},
-	}
+	// The revocation has arrived, so Lookup reports that no active membership remains for the pair.
+	// Under the EXISTS-active contract that is ErrWithdrawn, not a record carrying a revoked status:
+	// several memberships may exist and enforcement asks whether any of them is active.
+	stub := stubProjection{age: time.Second, lookupErr: projection.ErrWithdrawn}
 
 	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
 		decision, err := enforcer(t, stub, nil).Decide(context.Background(), class, membership(t), membership(t))
@@ -237,24 +237,6 @@ func TestAnActiveMembershipIsAllowedWithinTheWindow(t *testing.T) {
 	}
 }
 
-// TestASuspendedMembershipIsRefused keeps the third status from being treated as active. It arrives
-// on a security event and it is a withdrawal, not a lifecycle detail.
-func TestASuspendedMembershipIsRefused(t *testing.T) {
-	suspended := stubProjection{
-		age:    time.Second,
-		record: projection.Record{MembershipID: membership(t), Status: projection.Suspended, Version: 4},
-	}
-
-	decision, err := enforcer(t, suspended, nil).Decide(context.Background(),
-		httpapi.LowRisk, membership(t), membership(t))
-	if err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if decision.Allow {
-		t.Error("a suspended membership was served")
-	}
-}
-
 // TestLowRiskServesAStaleActiveAnswerAndMarksIt is what fail-open means under the positive-authority
 // model, and it is narrower than what it meant before.
 //
@@ -301,5 +283,30 @@ func TestHighConfidentialityRefusesAStaleActiveAnswer(t *testing.T) {
 	}
 	if decision.Allow {
 		t.Error("HIGH_CONFIDENTIALITY served an active membership from the projection")
+	}
+}
+
+// TestAWithdrawnPairIsRefusedAndDistinguishedFromAnUnknownOne keeps the two refusals apart. Both
+// deny, and an operator reading one needs to know whether this consumer has ever seen the principal.
+func TestAWithdrawnPairIsRefusedAndDistinguishedFromAnUnknownOne(t *testing.T) {
+	withdrawn := stubProjection{age: time.Second, lookupErr: projection.ErrWithdrawn}
+	unknown := stubProjection{age: time.Second, lookupErr: projection.ErrNotProjected}
+
+	first, err := enforcer(t, withdrawn, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide on a withdrawn pair: %v", err)
+	}
+	second, err := enforcer(t, unknown, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide on an unknown pair: %v", err)
+	}
+
+	if first.Allow || second.Allow {
+		t.Fatalf("a refusal was expected for both: withdrawn = %v, unknown = %v", first.Allow, second.Allow)
+	}
+	if first.Reason == second.Reason {
+		t.Errorf("both refusals read %q; a withdrawal and an unknown principal must be distinguishable", first.Reason)
 	}
 }
