@@ -70,8 +70,14 @@ CREATE INDEX IF NOT EXISTS membership_applied_mark_idx
 -- consumer that has bootstrapped from an empty estate is in a completely different state from one
 -- that never bootstrapped, and only this table can tell them apart.
 CREATE TABLE IF NOT EXISTS projection.watermark (
-    -- A single row, enforced rather than assumed.
-    only_row boolean PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    -- Keyed by consumer, not a single row.
+    --
+    -- The position belongs to the logical consumer: platform.processed_event deduplicates per
+    -- (event_id, consumer), so two consumers sharing this database each apply every event and each
+    -- have their own position. A single row made one consumer's bootstrap look like everybody's --
+    -- which surfaced as a test seeing itself bootstrapped because another test had seeded, and would
+    -- surface in production as a replica serving from authority it never took a snapshot for.
+    consumer text PRIMARY KEY,
 
     -- The mark the snapshot was taken at. NULL until a snapshot completes, and a NULL here means
     -- this consumer holds no positive authority for anything -- every projection-backed enforcement
@@ -87,4 +93,6 @@ CREATE TABLE IF NOT EXISTS projection.watermark (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
-INSERT INTO projection.watermark (only_row) VALUES (TRUE) ON CONFLICT DO NOTHING;
+-- No seed row: a consumer's row appears when it bootstraps. An absent row is the honest
+-- representation of "this consumer has taken no snapshot", and seeding one would make the absence
+-- indistinguishable from a snapshot at position zero.

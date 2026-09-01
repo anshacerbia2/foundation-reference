@@ -185,9 +185,13 @@ ON CONFLICT (tenant_id, principal_id) DO UPDATE
     OR (excluded.membership_id <> membership.membership_id
         AND excluded.applied_mark > membership.applied_mark)`
 
-const advanceWatermark = `UPDATE projection.watermark
-SET applied_mark = greatest(applied_mark, $1), updated_at = $2
-WHERE only_row`
+// Advancing inserts when absent so a consumer that has applied an event but not bootstrapped still
+// has a position -- and its NULL snapshot_mark is what refuses it authority.
+const advanceWatermark = `INSERT INTO projection.watermark (consumer, applied_mark, updated_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (consumer) DO UPDATE
+   SET applied_mark = greatest(watermark.applied_mark, excluded.applied_mark),
+       updated_at   = excluded.updated_at`
 
 // Apply projects one delivery. Safe to call with the same envelope any number of times, in any order
 // relative to other envelopes.
@@ -236,7 +240,7 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 		// The watermark advances whether or not the row was superseded: the delivery was seen, and a
 		// lag metric that ignored superseded deliveries would report a consumer as further behind
 		// than it is.
-		if _, err := tx.Exec(ctx, advanceWatermark, envelope.StreamPosition, appliedAt); err != nil {
+		if _, err := tx.Exec(ctx, advanceWatermark, p.consumer, envelope.StreamPosition, appliedAt); err != nil {
 			return fmt.Errorf("projection: advancing the watermark: %w", err)
 		}
 
@@ -316,13 +320,13 @@ func (p *Projector) Lookup(ctx context.Context, tenantID, principalID id.UUID) (
 }
 
 const positionStatement = `SELECT snapshot_mark, applied_mark, bootstrapped_at
-  FROM projection.watermark WHERE only_row`
+  FROM projection.watermark WHERE consumer = $1`
 
 // Position reports what this consumer knows about its place in the producer's stream.
 func (p *Projector) Position(ctx context.Context) (Position, error) {
 	var position Position
 	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-		rows, err := tx.Query(ctx, positionStatement)
+		rows, err := tx.Query(ctx, positionStatement, p.consumer)
 		if err != nil {
 			return fmt.Errorf("projection: reading the watermark: %w", err)
 		}
@@ -332,9 +336,9 @@ func (p *Projector) Position(ctx context.Context) (Position, error) {
 			if err := rows.Err(); err != nil {
 				return fmt.Errorf("projection: reading the watermark: %w", err)
 			}
-			// No row at all means the schema was applied and the seed row was not, which is a
-			// deployment fault rather than an un-bootstrapped consumer.
-			return errors.New("projection: the watermark row is missing")
+			// No row means this consumer has never applied anything and never bootstrapped. The zero
+			// Position is the honest answer: no snapshot mark, no applied mark.
+			return nil
 		}
 		return rows.Scan(&position.SnapshotMark, &position.AppliedMark, &position.BootstrappedAt)
 	})
@@ -355,9 +359,16 @@ ON CONFLICT (tenant_id, principal_id) DO UPDATE
        event_id                = excluded.event_id
  WHERE excluded.applied_mark > membership.applied_mark`
 
-const recordSnapshot = `UPDATE projection.watermark
-SET snapshot_mark = $1, bootstrapped_at = $2, updated_at = $2
-WHERE only_row`
+// Recording the snapshot mark inserts when absent, because a consumer's watermark row appears when
+// it first applies something or first bootstraps, whichever happens first — and a consumer may
+// legitimately bootstrap before any event has arrived.
+const recordSnapshot = `INSERT INTO projection.watermark
+    (consumer, snapshot_mark, applied_mark, bootstrapped_at, updated_at)
+VALUES ($1, $2, 0, $3, $3)
+ON CONFLICT (consumer) DO UPDATE
+   SET snapshot_mark   = excluded.snapshot_mark,
+       bootstrapped_at = excluded.bootstrapped_at,
+       updated_at      = excluded.updated_at`
 
 // Seeded is one row of a snapshot page.
 type Seeded struct {
@@ -397,7 +408,7 @@ func (p *Projector) Seed(ctx context.Context, rows []Seeded, mark int64, final b
 		}
 
 		if final {
-			if _, err := tx.Exec(ctx, recordSnapshot, mark, at); err != nil {
+			if _, err := tx.Exec(ctx, recordSnapshot, p.consumer, mark, at); err != nil {
 				return fmt.Errorf("projection: recording the snapshot mark: %w", err)
 			}
 		}
@@ -406,7 +417,7 @@ func (p *Projector) Seed(ctx context.Context, rows []Seeded, mark int64, final b
 }
 
 const ageStatement = `SELECT snapshot_mark IS NOT NULL, now() - updated_at
-  FROM projection.watermark WHERE only_row`
+  FROM projection.watermark WHERE consumer = $1`
 
 // Age reports how long since this consumer applied anything, and whether it has bootstrapped at all.
 //
@@ -427,7 +438,7 @@ func (p *Projector) Age(ctx context.Context) (time.Duration, error) {
 		age          time.Duration
 	)
 	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-		rows, err := tx.Query(ctx, ageStatement)
+		rows, err := tx.Query(ctx, ageStatement, p.consumer)
 		if err != nil {
 			return fmt.Errorf("projection: reading freshness: %w", err)
 		}
@@ -436,7 +447,9 @@ func (p *Projector) Age(ctx context.Context) (time.Duration, error) {
 			if err := rows.Err(); err != nil {
 				return fmt.Errorf("projection: reading freshness: %w", err)
 			}
-			return errors.New("projection: the watermark row is missing")
+			// No row: this consumer has never applied anything, so it certainly never bootstrapped.
+			bootstrapped = false
+			return nil
 		}
 		return rows.Scan(&bootstrapped, &age)
 	})
