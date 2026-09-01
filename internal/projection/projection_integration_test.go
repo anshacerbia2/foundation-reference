@@ -13,6 +13,7 @@ package projection_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -87,14 +88,25 @@ func newSubject(t *testing.T) subject {
 
 func revoked(t *testing.T, s subject, version int64) event.Envelope {
 	t.Helper()
+	return envelopeFor(t, s, version, projection.MembershipRevoked, "revoked")
+}
+
+func granted(t *testing.T, s subject, version int64) event.Envelope {
+	t.Helper()
+	return envelopeFor(t, s, version, projection.MembershipGranted, "active")
+}
+
+func envelopeFor(t *testing.T, s subject, version int64, typ event.Type, status string) event.Envelope {
+	t.Helper()
 
 	payload := projection.Payload{
 		MembershipID: s.membership,
 		TenantID:     s.tenant,
 		PrincipalID:  s.principal,
 		Version:      version,
+		Status:       status,
 	}
-	envelope, err := event.New(source, projection.MembershipRevoked, time.Now().UTC(), payload)
+	envelope, err := event.New(source, typ, time.Now().UTC(), payload)
 	if err != nil {
 		t.Fatalf("building an envelope: %v", err)
 	}
@@ -121,8 +133,8 @@ func TestApplyingARevocationProjectsIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
-	if !record.Revoked || record.Version != 3 {
-		t.Errorf("projected revoked = %v at version %d, want true at 3", record.Revoked, record.Version)
+	if record.Status != projection.Revoked || record.Version != 3 {
+		t.Errorf("projected status = %v at version %d, want revoked at 3", record.Status, record.Version)
 	}
 }
 
@@ -225,7 +237,8 @@ func TestAnUnknownEventTypeIsRefusedRatherThanIgnored(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
 	envelope := revoked(t, newSubject(t), 1)
-	envelope.Type = "com.scnehaux.organization.membership.lifecycle.granted"
+	// A type this consumer does not project: Tenant lifecycle belongs to a different consumer.
+	envelope.Type = "com.scnehaux.organization.tenant.lifecycle.requested"
 
 	// Refused, not silently skipped: a consumer that swallows an unrecognised type reports
 	// success for work it never did, and the dispatcher marks the row published.
@@ -245,20 +258,133 @@ func TestAMalformedPayloadIsRefused(t *testing.T) {
 	}
 }
 
-// TestAgeReportsHowStaleTheAnswerIs is the input to every fail-open decision, so it is
-// asserted rather than trusted.
-func TestAgeReportsHowStaleTheAnswerIs(t *testing.T) {
+// TestAgeRefusesUntilTheConsumerHasBootstrapped is the sound half of freshness on this side.
+//
+// Age answers "when did the last event land", which the principal review correctly refuses as a
+// security invariant: one event delivered now makes it look fresh while an older one is still in
+// flight. What it CAN answer soundly is whether this consumer has any positive authority at all, and
+// a consumer with no snapshot has none.
+func TestAgeRefusesUntilTheConsumerHasBootstrapped(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
 	if _, err := projector.Apply(ctx, revoked(t, newSubject(t), 1)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
+	// Applied an event and still not bootstrapped: exactly the state the bootstrap contract exists
+	// to make visible -- a model holding everything since it connected and nothing before.
+	if _, err := projector.Age(ctx); !errors.Is(err, projection.ErrNotBootstrapped) {
+		t.Fatalf("Age returned %v; want ErrNotBootstrapped before a snapshot", err)
+	}
+
+	seeded := newSubject(t)
+	if err := projector.Seed(ctx, []projection.Seeded{{
+		MembershipID: seeded.membership,
+		TenantID:     seeded.tenant,
+		PrincipalID:  seeded.principal,
+		Status:       projection.Active,
+		Version:      1,
+	}}, 1000, true); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
 	age, err := projector.Age(ctx)
 	if err != nil {
-		t.Fatalf("Age: %v", err)
+		t.Fatalf("Age after bootstrapping: %v", err)
 	}
 	if age < 0 || age > time.Minute {
-		t.Errorf("age = %s immediately after applying, want something under a minute", age)
+		t.Errorf("age = %s immediately after seeding, want something under a minute", age)
+	}
+
+	position, err := projector.Position(ctx)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if position.SnapshotMark == nil || *position.SnapshotMark != 1000 {
+		t.Errorf("snapshot mark = %v, want 1000", position.SnapshotMark)
+	}
+	if position.BootstrappedAt == nil {
+		t.Error("bootstrapped_at was not recorded")
+	}
+}
+
+// TestANewMembershipIsNotOlderThanTheRevokedOneItReplaces is the ordering rule the principal review
+// required before the four event types landed.
+//
+// membership_version is monotonic per membership and says nothing across memberships. Membership A
+// revoked at version 5, then membership B granted at version 1 for the same pair: comparing 1 against
+// 5 would discard the grant and leave the revocation standing forever. The producer's stream position
+// is what orders the two.
+func TestANewMembershipIsNotOlderThanTheRevokedOneItReplaces(t *testing.T) {
+	projector, _, ctx := fixture(t)
+	first := newSubject(t)
+
+	revocation := revoked(t, first, 5)
+	revocation.StreamPosition = 500
+	if _, err := projector.Apply(ctx, revocation); err != nil {
+		t.Fatalf("revoking membership A at version 5: %v", err)
+	}
+
+	// A different membership for the same (Tenant, Principal), granted afterwards at version 1.
+	replacement := first
+	replacement.membership = newID(t)
+	grant := granted(t, replacement, 1)
+	grant.StreamPosition = 501
+
+	outcome, err := projector.Apply(ctx, grant)
+	if err != nil {
+		t.Fatalf("granting membership B at version 1: %v", err)
+	}
+	if !outcome.Applied {
+		t.Fatalf("the replacement grant was discarded: applied = %v, superseded = %v. "+
+			"membership_version was compared across two different memberships",
+			outcome.Applied, outcome.Superseded)
+	}
+
+	record, err := projector.Lookup(ctx, first.tenant, first.principal)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	switch {
+	case record.Status != projection.Active:
+		t.Errorf("status = %s after a replacement grant, want active", record.Status)
+	case record.MembershipID != replacement.membership:
+		t.Errorf("membership_id = %s, want the replacement %s", record.MembershipID, replacement.membership)
+	case record.Version != 1:
+		t.Errorf("version = %d, want the replacement's 1", record.Version)
+	}
+}
+
+// TestAnOlderEventForADifferentMembershipIsSuperseded is the other direction, so the rule is not
+// simply "a different membership always wins".
+func TestAnOlderEventForADifferentMembershipIsSuperseded(t *testing.T) {
+	projector, _, ctx := fixture(t)
+	current := newSubject(t)
+
+	grant := granted(t, current, 2)
+	grant.StreamPosition = 900
+	if _, err := projector.Apply(ctx, grant); err != nil {
+		t.Fatalf("granting the current membership: %v", err)
+	}
+
+	stale := current
+	stale.membership = newID(t)
+	late := revoked(t, stale, 9)
+	late.StreamPosition = 800 // committed before the grant above
+
+	outcome, err := projector.Apply(ctx, late)
+	if err != nil {
+		t.Fatalf("applying the earlier event: %v", err)
+	}
+	if !outcome.Superseded {
+		t.Errorf("an event committed earlier for a replaced membership was applied: %+v", outcome)
+	}
+
+	record, err := projector.Lookup(ctx, current.tenant, current.principal)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if record.Status != projection.Active {
+		t.Errorf("status = %s; an earlier event for a different membership overwrote the current one", record.Status)
 	}
 }

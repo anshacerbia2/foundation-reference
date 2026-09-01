@@ -24,6 +24,8 @@ package projection_test
 
 import (
 	"testing"
+
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 func TestAnAcknowledgementLostAfterCommitIsSafeToRetry(t *testing.T) {
@@ -76,7 +78,7 @@ func TestAnAcknowledgementLostAfterCommitIsSafeToRetry(t *testing.T) {
 		t.Errorf("applied_at moved from %s to %s across a retry, so the row was rewritten",
 			before.AppliedAt, after.AppliedAt)
 	}
-	if !after.Revoked {
+	if after.Status != projection.Revoked {
 		t.Error("the membership is no longer revoked after a retry of its revocation")
 	}
 }

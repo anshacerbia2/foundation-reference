@@ -69,7 +69,7 @@ func enforcer(t *testing.T, p httpapi.Projection, a httpapi.Authority) *httpapi.
 func TestAnAppliedRevocationIsEnforcedForEveryClass(t *testing.T) {
 	stub := stubProjection{
 		age:    time.Second,
-		record: projection.Record{MembershipID: membership(t), Revoked: true, Version: 7},
+		record: projection.Record{MembershipID: membership(t), Status: projection.Revoked, Version: 7},
 	}
 
 	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
@@ -80,33 +80,6 @@ func TestAnAppliedRevocationIsEnforcedForEveryClass(t *testing.T) {
 		if decision.Allow {
 			t.Errorf("%s: allowed an operation for a revoked membership", class)
 		}
-	}
-}
-
-func TestLowRiskFailsOpenOnlyWithinTheBound(t *testing.T) {
-	fresh := stubProjection{age: 30 * time.Second, lookupErr: projection.ErrNotProjected}
-	stale := stubProjection{age: 10 * time.Minute, lookupErr: projection.ErrNotProjected}
-
-	within, err := enforcer(t, fresh, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
-	if err != nil {
-		t.Fatalf("Decide within the bound: %v", err)
-	}
-	if !within.Allow || within.Stale {
-		t.Errorf("a fresh projection with no revocation: allow = %v, stale = %v, want true and false",
-			within.Allow, within.Stale)
-	}
-
-	past, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
-	if err != nil {
-		t.Fatalf("Decide past the bound: %v", err)
-	}
-	if !past.Allow {
-		t.Error("LOW_RISK past the bound was refused; this class fails open by design")
-	}
-	// The allow is the designed behaviour; the flag is what makes it visible. An
-	// allow-while-stale that reports stale = false is an outage nobody can see.
-	if !past.Stale {
-		t.Error("LOW_RISK served from a stale projection did not report stale")
 	}
 }
 
@@ -136,22 +109,6 @@ func TestHighConfidentialityToleratesNoStaleness(t *testing.T) {
 	}
 }
 
-// TestLowRiskKeepsTheConfiguredWindow keeps the correction from over-reaching: the class that is
-// meant to serve stale answers within a bound still does, and still marks them.
-func TestLowRiskKeepsTheConfiguredWindow(t *testing.T) {
-	fresh := stubProjection{age: 30 * time.Second, lookupErr: projection.ErrNotProjected}
-
-	decision, err := enforcer(t, fresh, nil).Decide(context.Background(),
-		httpapi.LowRisk, membership(t), membership(t))
-	if err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if !decision.Allow || decision.Stale {
-		t.Errorf("LOW_RISK inside its window: allow = %v, stale = %v, want true and false",
-			decision.Allow, decision.Stale)
-	}
-}
-
 // TestABrokenReadNeverFailsOpen separates "the projection is behind" from "the projection
 // cannot be read". Fail-open exists for the first. Applying it to the second would turn a
 // database fault into an authorisation bypass, on the class where bypass is cheapest to
@@ -177,7 +134,7 @@ func TestABrokenReadNeverFailsOpen(t *testing.T) {
 func TestPrivilegedClassesNeverReadTheProjection(t *testing.T) {
 	contradicting := stubProjection{
 		age:    time.Second,
-		record: projection.Record{MembershipID: membership(t), Revoked: true, Version: 9},
+		record: projection.Record{MembershipID: membership(t), Status: projection.Revoked, Version: 9},
 	}
 	authority := stubAuthority{granted: true}
 
@@ -220,22 +177,129 @@ func TestAMissingAuthorityRefusesThePrivilegedClasses(t *testing.T) {
 	}
 }
 
-func TestAColdProjectionFollowsTheClassPolicy(t *testing.T) {
-	cold := stubProjection{ageErr: projection.ErrProjectionCold, lookupErr: projection.ErrProjectionCold}
+// TestAConsumerThatNeverBootstrappedRefusesEverything is the invariant that replaced the cold-
+// projection case, and it is sound where the old one was not.
+//
+// A consumer with no snapshot holds a model containing everything since it connected and nothing
+// before. It has no positive authority for anyone, so no class may serve from it -- including the
+// class that otherwise fails open, because fail-open is for an answer that may be out of date, not
+// for having no answer at all.
+func TestAConsumerThatNeverBootstrappedRefusesEverything(t *testing.T) {
+	unbootstrapped := stubProjection{ageErr: projection.ErrNotBootstrapped, lookupErr: projection.ErrNotProjected}
 
-	open, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
-	if err != nil {
-		t.Fatalf("Decide LOW_RISK: %v", err)
+	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
+		decision, err := enforcer(t, unbootstrapped, nil).Decide(context.Background(),
+			class, membership(t), membership(t))
+		if err != nil {
+			t.Fatalf("%s: Decide: %v", class, err)
+		}
+		if decision.Allow {
+			t.Errorf("%s: a consumer that never bootstrapped served a request", class)
+		}
 	}
-	if !open.Allow {
-		t.Error("LOW_RISK on a cold projection was refused; this class fails open")
+}
+
+// TestAnAbsentMembershipIsRefusedForEveryClass is the principal review's first P0, as an assertion.
+//
+// Absence of a projected membership is not permission. Before this, an absent row meant either "holds
+// an active membership" and "was never a member", and the consumer allowed both -- so "allowed" meant
+// no bad news had arrived rather than authority being present.
+func TestAnAbsentMembershipIsRefusedForEveryClass(t *testing.T) {
+	fresh := stubProjection{age: time.Second, lookupErr: projection.ErrNotProjected}
+
+	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
+		decision, err := enforcer(t, fresh, nil).Decide(context.Background(),
+			class, membership(t), membership(t))
+		if err != nil {
+			t.Fatalf("%s: Decide: %v", class, err)
+		}
+		if decision.Allow {
+			t.Errorf("%s: allowed an operation with no projected membership", class)
+		}
+	}
+}
+
+// TestAnActiveMembershipIsAllowedWithinTheWindow is the other half, and it must be asserted too: a
+// model that refuses everything is trivially safe and useless.
+func TestAnActiveMembershipIsAllowedWithinTheWindow(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
 	}
 
-	closed, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t), membership(t))
+	decision, err := enforcer(t, active, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
-		t.Fatalf("Decide HIGH_CONFIDENTIALITY: %v", err)
+		t.Fatalf("Decide: %v", err)
 	}
-	if closed.Allow {
-		t.Error("HIGH_CONFIDENTIALITY on a cold projection was allowed")
+	if !decision.Allow {
+		t.Errorf("an active membership inside the window was refused: %s", decision.Reason)
+	}
+}
+
+// TestASuspendedMembershipIsRefused keeps the third status from being treated as active. It arrives
+// on a security event and it is a withdrawal, not a lifecycle detail.
+func TestASuspendedMembershipIsRefused(t *testing.T) {
+	suspended := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Suspended, Version: 4},
+	}
+
+	decision, err := enforcer(t, suspended, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.Allow {
+		t.Error("a suspended membership was served")
+	}
+}
+
+// TestLowRiskServesAStaleActiveAnswerAndMarksIt is what fail-open means under the positive-authority
+// model, and it is narrower than what it meant before.
+//
+// Fail-open applies to a positive answer that may be out of date -- an active membership whose
+// revocation might be in flight. It does NOT apply to the absence of an answer, which is now a
+// refusal for every class. The old test asserted the opposite, and it was asserting the defect.
+func TestLowRiskServesAStaleActiveAnswerAndMarksIt(t *testing.T) {
+	active := projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3}
+
+	within, err := enforcer(t, stubProjection{age: 30 * time.Second, record: active}, nil).
+		Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide inside the window: %v", err)
+	}
+	if !within.Allow || within.Stale {
+		t.Errorf("active inside the window: allow = %v, stale = %v, want true and false",
+			within.Allow, within.Stale)
+	}
+
+	past, err := enforcer(t, stubProjection{age: 10 * time.Minute, record: active}, nil).
+		Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide past the window: %v", err)
+	}
+	if !past.Allow {
+		t.Errorf("LOW_RISK refused a stale active membership; this class fails open: %s", past.Reason)
+	}
+	// The allow is the designed behaviour; the flag is what makes it visible. An allow-while-stale
+	// reporting stale = false is an outage nobody can see.
+	if !past.Stale {
+		t.Error("a stale active answer was served without being marked stale")
+	}
+}
+
+// TestHighConfidentialityRefusesAStaleActiveAnswer is the same case on the class that tolerates
+// nothing: an active membership is not enough, because its withdrawal may be in flight.
+func TestHighConfidentialityRefusesAStaleActiveAnswer(t *testing.T) {
+	active := projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3}
+
+	decision, err := enforcer(t, stubProjection{age: time.Second, record: active}, nil).
+		Decide(context.Background(), httpapi.HighConfidentiality, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.Allow {
+		t.Error("HIGH_CONFIDENTIALITY served an active membership from the projection")
 	}
 }

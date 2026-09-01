@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,6 +31,13 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
+	// -rebuild is a deliberate act, not a default. It drops the projection, after which the consumer
+	// holds no positive authority and refuses every projection-backed operation until it has taken a
+	// snapshot and caught up -- correct behaviour, and a catastrophic thing to do on every deploy.
+	rebuild := flag.Bool("rebuild", false,
+		"drop the projection first, so it can be rebuilt from a snapshot")
+	flag.Parse()
+
 	dsn := os.Getenv("REFERENCE_MIGRATION_DATABASE_URL")
 	if dsn == "" {
 		return errors.New("REFERENCE_MIGRATION_DATABASE_URL is required")
@@ -47,6 +55,14 @@ func run(logger *slog.Logger) error {
 	// PlatformMigrations already returns them in application order, derived from the file
 	// names rather than from a manifest. Re-sorting here would be a second ordering rule
 	// that could disagree with the substrate's.
+	if *rebuild {
+		if err := exec(ctx, pool, projection.Rebuild); err != nil {
+			return fmt.Errorf("dropping the projection: %w", err)
+		}
+		logger.Warn("projection dropped; it holds no positive authority until it has bootstrapped",
+			slog.String("source", "projection/rebuild.sql"))
+	}
+
 	migrations, err := platform.PlatformMigrations()
 	if err != nil {
 		return fmt.Errorf("reading the platform set: %w", err)

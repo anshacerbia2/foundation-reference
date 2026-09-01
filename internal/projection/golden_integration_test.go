@@ -90,7 +90,7 @@ func TestTheGoldenEnvelopeIsAppliedAsTheProducerSentIt(t *testing.T) {
 		t.Fatalf("the event applied but the pair it names cannot be read back: %v", err)
 	}
 	switch {
-	case !applied.Revoked:
+	case applied.Status != projection.Revoked:
 		t.Error("the membership is not revoked after applying a revocation")
 	case applied.Version != payload.Version:
 		t.Errorf("projected version %d, and the producer sent membership_version %d",

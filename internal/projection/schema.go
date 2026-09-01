@@ -10,3 +10,12 @@ import _ "embed"
 //
 //go:embed schema.sql
 var Schema string
+
+// Rebuild drops the projection so it can be rebuilt from a snapshot.
+//
+// Separate from Schema and applied only when asked for. A projection's recovery is
+// rebuild-from-snapshot rather than repair, so dropping it is legitimate -- but it is an operation
+// somebody chooses, never a side effect of a migration run.
+//
+//go:embed rebuild.sql
+var Rebuild string

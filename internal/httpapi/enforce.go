@@ -95,6 +95,18 @@ func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantI
 func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tenantID, principalID id.UUID) (Decision, error) {
 	age, ageErr := e.projector.Age(ctx)
 
+	// A consumer that never took a snapshot holds a model containing everything that happened since
+	// it connected and nothing that happened before, so it holds no positive authority for anyone.
+	// Refused for every class, ahead of any freshness question: this is the one invariant on this
+	// side that is sound rather than a hint.
+	if errors.Is(ageErr, projection.ErrNotBootstrapped) {
+		return Decision{
+			Allow:  false,
+			Reason: "this consumer has taken no snapshot, so it holds no projected authority",
+			Stale:  true,
+		}, nil
+	}
+
 	// >= rather than > when the budget is zero, so a class declaring zero tolerance treats any
 	// projection as stale. With >, a budget of zero would admit an age of zero — which is only
 	// ever true of a projection that just applied something, so the class would pass or fail on
@@ -103,24 +115,17 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 
 	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
-	case err == nil && record.Revoked:
-		// A revocation that has been applied is enforced regardless of class or freshness.
-		// This is the property Proof A exists to demonstrate.
-		return Decision{
-			Allow:  false,
-			Reason: fmt.Sprintf("membership revoked at version %d", record.Version),
-			Stale:  stale,
-			Age:    age,
-		}, nil
-
-	case errors.Is(err, projection.ErrNotProjected):
-		// Never seen. Absence of a revocation is not proof of validity: it is either a
-		// membership that was never revoked, or one whose revocation has not arrived.
-		// Only freshness tells those apart, and only the class decides what to do about it.
+	case err == nil && record.Active():
+		// Positive authority, present rather than inferred. This is the answer that was impossible
+		// while the projection held only revocations: absence had to mean permission, so "allowed"
+		// meant "no bad news has arrived".
+		//
+		// Freshness still decides whether the answer may be used, because an active row can be one
+		// the revocation has not reached yet.
 		if !stale {
 			return Decision{
 				Allow:  true,
-				Reason: fmt.Sprintf("no revocation applied, projection is %s old", age.Round(time.Millisecond)),
+				Reason: fmt.Sprintf("membership active at version %d", record.Version),
 				Age:    age,
 			}, nil
 		}
@@ -139,8 +144,33 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 			Age:    age,
 		}, nil
 
-	case errors.Is(err, projection.ErrProjectionCold):
-		return Decision{Allow: policy.FailOpen, Reason: "the projection has applied nothing yet", Stale: true}, nil
+	case err == nil:
+		// A revocation that has been applied is enforced regardless of class or freshness.
+		// This is the property Proof A exists to demonstrate.
+		// Projected and not active: suspended or revoked. Refused regardless of class and regardless
+		// of freshness, because a withdrawal that has arrived is not made less true by being old.
+		// This is the property Proof A exists to demonstrate.
+		return Decision{
+			Allow:  false,
+			Reason: fmt.Sprintf("membership is %s at version %d", record.Status, record.Version),
+			Stale:  stale,
+			Age:    age,
+		}, nil
+
+	case errors.Is(err, projection.ErrNotProjected):
+		// No positive authority is projected for this pair, so there is nothing to permit. Refused
+		// for every class, and freshness does not enter into it: fail-open exists for an answer that
+		// might be out of date, not for the absence of an answer.
+		//
+		// This is the correction the principal review's first P0 demanded. Before, an absent row was
+		// indistinguishable between "holds an active membership" and "was never a member", and the
+		// consumer permitted both.
+		return Decision{
+			Allow:  false,
+			Reason: "no membership is projected for this principal in this tenant",
+			Stale:  stale,
+			Age:    age,
+		}, nil
 
 	default:
 		// The read itself broke. This is never fail-open eligible, whatever the class:
