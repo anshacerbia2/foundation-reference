@@ -93,3 +93,36 @@ func TestAnUndeclaredClassIsAnError(t *testing.T) {
 		t.Errorf("PolicyFor on an unknown class returned %v, want ErrUnknownClass", err)
 	}
 }
+
+// TestBehaviourAgreesWithTheFailurePolicy keeps the estate's vocabulary and this package's booleans
+// from drifting. Two fields describing one decision is a liability the moment they disagree: the
+// registry would say one thing about a consumer and the code would do another, and only the code
+// would be enforced.
+func TestBehaviourAgreesWithTheFailurePolicy(t *testing.T) {
+	for _, class := range httpapi.Classes() {
+		policy, err := httpapi.PolicyFor(class)
+		if err != nil {
+			t.Fatalf("PolicyFor(%s): %v", class, err)
+		}
+
+		switch policy.Behavior {
+		case httpapi.UseWithMarker:
+			if !policy.FailOpen || !policy.UsesProjection {
+				t.Errorf("%s is use_with_marker but does not serve from the projection", class)
+			}
+		case httpapi.FailClosed:
+			if policy.FailOpen || !policy.UsesProjection {
+				t.Errorf("%s is fail_closed but fails open or bypasses the projection", class)
+			}
+		case httpapi.Revalidate:
+			if policy.UsesProjection {
+				t.Errorf("%s is revalidate but reads the projection instead of the authority", class)
+			}
+			if policy.FailOpen {
+				t.Errorf("%s is revalidate and fails open; an unrevalidated call must be refused", class)
+			}
+		default:
+			t.Errorf("%s carries behaviour %q, which is not one the registry declares", class, policy.Behavior)
+		}
+	}
+}

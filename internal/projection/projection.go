@@ -50,7 +50,19 @@ type Payload struct {
 	MembershipID id.UUID `json:"membership_id"`
 	TenantID     id.UUID `json:"tenant_id"`
 	PrincipalID  id.UUID `json:"principal_id"`
-	Version      int64   `json:"version"`
+
+	// membership_version, not "version". The producer's name, read from a real event rather than
+	// assumed: the first end-to-end run refused every delivery with "membership_id and a positive
+	// version are required" because this field was called version here and nothing carried it.
+	//
+	// The consumer's tests had passed throughout, because they built payloads from this same struct
+	// -- a fixture and a producer that agree with each other and with nobody else.
+	Version int64 `json:"membership_version"`
+
+	// TenantSecurityVersion travels with the event and is not projected yet. Named here so the
+	// contract this consumer reads is visible in one place; a field added silently later would be
+	// indistinguishable from one that was always ignored.
+	TenantSecurityVersion int64 `json:"tenant_security_version"`
 }
 
 // Record is what an enforcement decision reads.

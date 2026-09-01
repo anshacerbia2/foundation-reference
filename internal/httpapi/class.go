@@ -49,15 +49,35 @@ type Policy struct {
 	// AuditEveryAccess distinguishes the classes where each access is recorded from those
 	// where an aggregate is enough.
 	AuditEveryAccess bool
+
+	// Behavior is the estate's own name for what this class does with a stale projection.
+	//
+	// organization-control's consumer registry already declares three: use_with_marker,
+	// revalidate, and fail_closed. Naming them here rather than only carrying FailOpen keeps one
+	// vocabulary across the estate -- a second set of words for the same three behaviours is how
+	// a registered consumer ends up described one way in the registry and behaving another.
+	//
+	// The registry holds one value per consumer while enforcement here is per operation class, so
+	// the two cannot correspond exactly. That mismatch is a contract question rather than a bug in
+	// either place, and TestBehaviourAgreesWithTheFailurePolicy keeps the two fields from drifting
+	// in the meantime.
+	Behavior string
 }
+
+// The three behaviours organization-control's registry declares.
+const (
+	UseWithMarker = "use_with_marker"
+	Revalidate    = "revalidate"
+	FailClosed    = "fail_closed"
+)
 
 // policies is the whole table, in one place, because a policy spread across handlers is a
 // policy nobody can read. Adding a class without adding a row here fails at startup.
 var policies = map[Class]Policy{
-	LowRisk:             {FailOpen: true, UsesProjection: true, AuditEveryAccess: false},
-	HighConfidentiality: {FailOpen: false, UsesProjection: true, AuditEveryAccess: true},
-	Privileged:          {FailOpen: false, UsesProjection: false, AuditEveryAccess: true},
-	Irreversible:        {FailOpen: false, UsesProjection: false, AuditEveryAccess: true},
+	LowRisk:             {FailOpen: true, UsesProjection: true, AuditEveryAccess: false, Behavior: UseWithMarker},
+	HighConfidentiality: {FailOpen: false, UsesProjection: true, AuditEveryAccess: true, Behavior: FailClosed},
+	Privileged:          {FailOpen: false, UsesProjection: false, AuditEveryAccess: true, Behavior: Revalidate},
+	Irreversible:        {FailOpen: false, UsesProjection: false, AuditEveryAccess: true, Behavior: Revalidate},
 }
 
 func PolicyFor(class Class) (Policy, error) {
