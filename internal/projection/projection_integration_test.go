@@ -46,10 +46,15 @@ func fixture(t *testing.T) (*projection.Projector, *db.Pool, context.Context) {
 	}
 	t.Cleanup(pool.Close)
 
-	// A distinct consumer name per test, because inbox.Guard deduplicates per
-	// (event_id, consumer): a shared name would let one test's deliveries look like
-	// duplicates to the next.
-	projector, err := projection.New(pool, "test-"+t.Name())
+	// A distinct consumer name per test AND per run, because inbox.Guard deduplicates per
+	// (event_id, consumer).
+	//
+	// Per test, so one test's deliveries do not look like duplicates to the next. Per run, because
+	// the golden envelope carries a fixed event identifier: with a name stable across runs, the
+	// first run applied it and every run afterwards saw a duplicate and failed. The tests that mint
+	// their own identifiers never noticed, which is why the suffix belongs here rather than in the
+	// one test that tripped over it.
+	projector, err := projection.New(pool, "test-"+t.Name()+"-"+newID(t).String())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -18,18 +18,20 @@ package projection_test
 // not editing it to match the code.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/anshacerbia2/foundation-platform/db"
 	"github.com/anshacerbia2/foundation-platform/event"
 
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 func TestTheGoldenEnvelopeIsAppliedAsTheProducerSentIt(t *testing.T) {
-	projector, _, ctx := fixture(t)
+	projector, pool, ctx := fixture(t)
 
 	raw, err := os.ReadFile(filepath.Join("testdata", "membership-security-revoked.json"))
 	if err != nil {
@@ -48,6 +50,25 @@ func TestTheGoldenEnvelopeIsAppliedAsTheProducerSentIt(t *testing.T) {
 			envelope.Type, projection.MembershipRevoked)
 	}
 
+	var payload projection.Payload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decoding the golden payload: %v", err)
+	}
+
+	// The golden envelope names a real (Tenant, Principal) pair at a fixed version, so a database
+	// that has already seen that pair at the same or a higher version supersedes it -- and the test
+	// would report "not applied" for a consumer that is working correctly. Every other test here
+	// mints its own identifiers and never meets this. Cleared rather than worked around, because
+	// what this test asserts is decoding and projection, not what the row happened to hold before.
+	if err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := tx.Exec(ctx,
+			`DELETE FROM projection.membership WHERE tenant_id = $1 AND principal_id = $2`,
+			payload.TenantID.String(), payload.PrincipalID.String())
+		return err
+	}); err != nil {
+		t.Fatalf("clearing the pair the golden envelope names: %v", err)
+	}
+
 	outcome, err := projector.Apply(ctx, envelope)
 	if err != nil {
 		t.Fatalf("applying a real event failed, which is the defect this fixture exists to catch: %v", err)
@@ -57,17 +78,11 @@ func TestTheGoldenEnvelopeIsAppliedAsTheProducerSentIt(t *testing.T) {
 			outcome.Applied, outcome.Duplicate, outcome.Superseded)
 	}
 
-	// And the members enforcement depends on arrived intact. A payload that decodes without error
-	// but yields a zero tenant would leave every enforcement check looking at the wrong row.
-	record, err := projector.Lookup(ctx, envelope.ID, envelope.ID)
-	if err == nil {
-		t.Fatal("Lookup answered for a (tenant, principal) pair the event does not name")
-	}
-	_ = record
-
-	var payload projection.Payload
-	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
-		t.Fatalf("decoding the golden payload: %v", err)
+	// And the members enforcement depends on arrived intact. A payload that decoded without error
+	// but yielded a zero tenant would leave every enforcement check reading the wrong row, and the
+	// apply above would still have reported success.
+	if payload.TenantID.IsNil() || payload.PrincipalID.IsNil() {
+		t.Fatal("the golden payload decoded with a nil tenant or principal")
 	}
 
 	applied, err := projector.Lookup(ctx, payload.TenantID, payload.PrincipalID)
