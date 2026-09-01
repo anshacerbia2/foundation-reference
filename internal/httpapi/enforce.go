@@ -58,7 +58,10 @@ func (e *Enforcer) Decide(ctx context.Context, class Class, tenantID, principalI
 	if !policy.UsesProjection {
 		return e.decideFromAuthority(ctx, class, tenantID, principalID)
 	}
-	return e.decideFromProjection(ctx, policy, tenantID, principalID)
+	// The budget comes from the class, with the configured window applied only to the class that
+	// declares one. Reading e.maxAge here directly is what let HIGH_CONFIDENTIALITY inherit
+	// LOW_RISK's sixty seconds while declaring zero tolerance.
+	return e.decideFromProjection(ctx, policy.FromConfig(e.maxAge), tenantID, principalID)
 }
 
 func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantID, principalID id.UUID) (Decision, error) {
@@ -91,7 +94,12 @@ func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantI
 
 func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tenantID, principalID id.UUID) (Decision, error) {
 	age, ageErr := e.projector.Age(ctx)
-	stale := ageErr != nil || age > e.maxAge
+
+	// >= rather than > when the budget is zero, so a class declaring zero tolerance treats any
+	// projection as stale. With >, a budget of zero would admit an age of zero — which is only
+	// ever true of a projection that just applied something, so the class would pass or fail on
+	// whether an unrelated event happened to land in the same instant.
+	stale := ageErr != nil || age > policy.MaxStale || policy.MaxStale == 0
 
 	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
@@ -119,14 +127,14 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		if policy.FailOpen {
 			return Decision{
 				Allow:  true,
-				Reason: e.staleReason(ageErr, age) + ", and this class fails open",
+				Reason: e.staleReason(ageErr, age, policy.MaxStale) + ", and this class fails open",
 				Stale:  true,
 				Age:    age,
 			}, nil
 		}
 		return Decision{
 			Allow:  false,
-			Reason: e.staleReason(ageErr, age) + ", and this class fails closed",
+			Reason: e.staleReason(ageErr, age, policy.MaxStale) + ", and this class fails closed",
 			Stale:  true,
 			Age:    age,
 		}, nil
@@ -142,10 +150,13 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 	}
 }
 
-func (e *Enforcer) staleReason(ageErr error, age time.Duration) string {
+func (e *Enforcer) staleReason(ageErr error, age, budget time.Duration) string {
 	if ageErr != nil {
 		return "the projection's freshness is unknown"
 	}
-	return fmt.Sprintf("the projection is %s old, past the %s bound",
-		age.Round(time.Millisecond), e.maxAge)
+	if budget == 0 {
+		return "this class tolerates no staleness, and a projection is not an authoritative answer"
+	}
+	return fmt.Sprintf("the projection is %s old, past this class's %s bound",
+		age.Round(time.Millisecond), budget)
 }

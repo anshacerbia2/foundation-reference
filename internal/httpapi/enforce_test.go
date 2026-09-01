@@ -110,15 +110,45 @@ func TestLowRiskFailsOpenOnlyWithinTheBound(t *testing.T) {
 	}
 }
 
-func TestHighConfidentialityFailsClosedPastTheBound(t *testing.T) {
-	stale := stubProjection{age: 10 * time.Minute, lookupErr: projection.ErrNotProjected}
+// TestHighConfidentialityToleratesNoStaleness is the correction the principal review demanded.
+//
+// The class declared fail_closed and then read LOW_RISK's configured window, so a
+// thirty-second-old projection with no recorded revocation served confidential data. Its budget is
+// now its own and it is zero, which means a projection is never a sufficient answer for it -- at
+// any age.
+//
+// Note what that exposes rather than hides: while this consumer projects only revocations, absence
+// of a row is not positive authority, so HIGH_CONFIDENTIALITY refuses everything. That is the
+// honest consequence of two facts the review named together, and it changes when the projection
+// holds positive membership state.
+func TestHighConfidentialityToleratesNoStaleness(t *testing.T) {
+	for _, age := range []time.Duration{0, time.Second, 30 * time.Second, 10 * time.Minute} {
+		stub := stubProjection{age: age, lookupErr: projection.ErrNotProjected}
 
-	decision, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t), membership(t))
+		decision, err := enforcer(t, stub, nil).Decide(context.Background(),
+			httpapi.HighConfidentiality, membership(t), membership(t))
+		if err != nil {
+			t.Fatalf("age %s: Decide: %v", age, err)
+		}
+		if decision.Allow {
+			t.Errorf("age %s: HIGH_CONFIDENTIALITY was served from a projection", age)
+		}
+	}
+}
+
+// TestLowRiskKeepsTheConfiguredWindow keeps the correction from over-reaching: the class that is
+// meant to serve stale answers within a bound still does, and still marks them.
+func TestLowRiskKeepsTheConfiguredWindow(t *testing.T) {
+	fresh := stubProjection{age: 30 * time.Second, lookupErr: projection.ErrNotProjected}
+
+	decision, err := enforcer(t, fresh, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if decision.Allow {
-		t.Error("HIGH_CONFIDENTIALITY was served from a projection past its bound")
+	if !decision.Allow || decision.Stale {
+		t.Errorf("LOW_RISK inside its window: allow = %v, stale = %v, want true and false",
+			decision.Allow, decision.Stale)
 	}
 }
 

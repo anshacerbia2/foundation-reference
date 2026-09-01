@@ -86,3 +86,31 @@ adapter and the choice is made later, on evidence.
 
 **No authentication yet.** The intake and the operations are open. That is the next commit,
 not an oversight: Proof A's first question is whether enforcement happens at all.
+
+## Registered baseline, and why it is use_with_marker
+
+organization-control's consumer registry holds one `stale_behavior` per consumer, while enforcement
+here is per operation class. Under the rule the estate settled on -- the registered value is the
+**maximum permissiveness** a consumer may use, and an operation may only be stricter -- this consumer
+registers:
+
+```text
+stale_behavior = use_with_marker
+```
+
+It was registered as `revalidate` first, and that was inconsistent with the rule rather than merely
+imprecise: `revalidate` is stricter than `use_with_marker`, so LOW_RISK would have been operating
+*more permissively* than its own registration allowed. The baseline has to be the loosest behaviour
+any class here uses, not the strictest.
+
+| Class | Behaviour | Staleness budget |
+| :-- | :-- | :-- |
+| `LOW_RISK` | `use_with_marker` | the configured window |
+| `HIGH_CONFIDENTIALITY` | `fail_closed` | zero |
+| `PRIVILEGED` | `revalidate` | never reads the projection |
+| `IRREVERSIBLE` | `revalidate` | never reads the projection |
+
+Zero is not the configured window rounded down. A class that declares no staleness tolerance and
+then reads a window from configuration has a declaration that decorates rather than binds -- which
+is what happened: HIGH_CONFIDENTIALITY inherited LOW_RISK's sixty seconds and served confidential
+data from a thirty-second-old projection.

@@ -62,6 +62,27 @@ type Policy struct {
 	// either place, and TestBehaviourAgreesWithTheFailurePolicy keeps the two fields from drifting
 	// in the meantime.
 	Behavior string
+
+	// MaxStale is this class's own freshness budget, and zero means zero tolerance.
+	//
+	// One global window for every projection-backed class was wrong, and the principal review
+	// named it: HIGH_CONFIDENTIALITY declared fail_closed and then inherited LOW_RISK's sixty
+	// seconds, so a thirty-second-old projection with no recorded revocation served confidential
+	// data. A class that declares zero stale tolerance and reads a window from configuration is a
+	// class whose declaration is decoration.
+	//
+	// LOW_RISK is the only class that takes the configured value; the others carry their own, and
+	// the enforcer reads the policy rather than the configuration.
+	MaxStale time.Duration
+}
+
+// FromConfig returns the policy with the deployment's window applied to the one class that has
+// one. Every other class keeps the budget it declares.
+func (p Policy) FromConfig(configured time.Duration) Policy {
+	if p.Behavior == UseWithMarker {
+		p.MaxStale = configured
+	}
+	return p
 }
 
 // The three behaviours organization-control's registry declares.
@@ -74,8 +95,9 @@ const (
 // policies is the whole table, in one place, because a policy spread across handlers is a
 // policy nobody can read. Adding a class without adding a row here fails at startup.
 var policies = map[Class]Policy{
-	LowRisk:             {FailOpen: true, UsesProjection: true, AuditEveryAccess: false, Behavior: UseWithMarker},
-	HighConfidentiality: {FailOpen: false, UsesProjection: true, AuditEveryAccess: true, Behavior: FailClosed},
+	// MaxStale on LOW_RISK is a placeholder replaced by FromConfig; the others are the budget.
+	LowRisk:             {FailOpen: true, UsesProjection: true, AuditEveryAccess: false, Behavior: UseWithMarker, MaxStale: time.Minute},
+	HighConfidentiality: {FailOpen: false, UsesProjection: true, AuditEveryAccess: true, Behavior: FailClosed, MaxStale: 0},
 	Privileged:          {FailOpen: false, UsesProjection: false, AuditEveryAccess: true, Behavior: Revalidate},
 	Irreversible:        {FailOpen: false, UsesProjection: false, AuditEveryAccess: true, Behavior: Revalidate},
 }

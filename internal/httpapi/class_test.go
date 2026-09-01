@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
 )
@@ -123,6 +124,31 @@ func TestBehaviourAgreesWithTheFailurePolicy(t *testing.T) {
 			}
 		default:
 			t.Errorf("%s carries behaviour %q, which is not one the registry declares", class, policy.Behavior)
+		}
+	}
+}
+
+// TestOnlyTheMarkerClassCarriesAStalenessBudget states the rule that broke before: a class whose
+// declared behaviour is fail_closed or revalidate must not have a window, because a window is
+// permission to answer from a replica.
+func TestOnlyTheMarkerClassCarriesAStalenessBudget(t *testing.T) {
+	for _, class := range httpapi.Classes() {
+		policy, err := httpapi.PolicyFor(class)
+		if err != nil {
+			t.Fatalf("PolicyFor(%s): %v", class, err)
+		}
+
+		applied := policy.FromConfig(90 * time.Second)
+		switch class {
+		case httpapi.LowRisk:
+			if applied.MaxStale != 90*time.Second {
+				t.Errorf("LOW_RISK ignored the configured window: %s", applied.MaxStale)
+			}
+		default:
+			if applied.MaxStale != 0 {
+				t.Errorf("%s took a %s staleness budget from configuration; only LOW_RISK may have one",
+					class, applied.MaxStale)
+			}
 		}
 	}
 }
