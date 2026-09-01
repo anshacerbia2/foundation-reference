@@ -8,8 +8,11 @@ package httpapi_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/anshacerbia2/foundation-reference/internal/frontier"
 
 	"github.com/anshacerbia2/foundation-platform/id"
 
@@ -53,9 +56,34 @@ func membership(t *testing.T) id.UUID {
 	return parsed
 }
 
+// stubFrontier is a producer that owes nothing unless told otherwise, so the existing cases keep
+// asserting what they were written to assert.
+type stubFrontier struct {
+	facts frontier.Facts
+	err   error
+}
+
+func (s stubFrontier) Frontier(context.Context) (frontier.Facts, error) {
+	return s.facts, s.err
+}
+
+// current is a producer with nothing owed, observed just now.
+func current() stubFrontier {
+	return stubFrontier{facts: frontier.Facts{
+		HighestCommittedMark: 100,
+		ObservedAt:           time.Now().UTC(),
+		ReadAt:               time.Now().UTC(),
+	}}
+}
+
 func enforcer(t *testing.T, p httpapi.Projection, a httpapi.Authority) *httpapi.Enforcer {
 	t.Helper()
-	built, err := httpapi.NewEnforcer(p, a, 60*time.Second)
+	return enforcerWith(t, p, a, current())
+}
+
+func enforcerWith(t *testing.T, p httpapi.Projection, a httpapi.Authority, f httpapi.Frontier) *httpapi.Enforcer {
+	t.Helper()
+	built, err := httpapi.NewEnforcer(p, a, f, 60*time.Second)
 	if err != nil {
 		t.Fatalf("NewEnforcer: %v", err)
 	}
@@ -309,4 +337,103 @@ func TestAWithdrawnPairIsRefusedAndDistinguishedFromAnUnknownOne(t *testing.T) {
 	if first.Reason == second.Reason {
 		t.Errorf("both refusals read %q; a withdrawal and an unknown principal must be distinguishable", first.Reason)
 	}
+}
+
+// TestAProducerBehindItsBudgetMakesTheConsumerStale is the term only the producer can supply.
+//
+// The projection is young and holds an active membership, so every local signal says fresh. The
+// producer has owed a delivery for ten minutes, which the consumer cannot see: a gap below its own
+// applied position is indistinguishable from a sequence number a rolled-back transaction consumed.
+func TestAProducerBehindItsBudgetMakesTheConsumerStale(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	behind := stubFrontier{facts: frontier.Facts{
+		HighestCommittedMark:  120,
+		OldestUnpublishedMark: 90,
+		OldestUnpublishedAge:  10 * time.Minute,
+		Unpublished:           true,
+		ObservedAt:            time.Now().UTC(),
+		ReadAt:                time.Now().UTC(),
+	}}
+
+	// LOW_RISK fails open, so it serves -- and must say it is stale.
+	low, err := enforcerWith(t, active, nil, behind).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !low.Stale {
+		t.Error("a producer ten minutes behind did not make the answer stale")
+	}
+	if low.Reason == "" || !contains(low.Reason, "owed") {
+		t.Errorf("the reason does not name the producer's backlog: %q", low.Reason)
+	}
+}
+
+// TestAnUnreachableFrontierIsStaleRatherThanFine keeps "unknown" apart from "nothing owed".
+func TestAnUnreachableFrontierIsStaleRatherThanFine(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	unreachable := stubFrontier{err: errors.New("dial tcp: connection refused")}
+
+	decision, err := enforcerWith(t, active, nil, unreachable).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Stale {
+		t.Error("an unreachable frontier was treated as a producer that owes nothing")
+	}
+}
+
+// TestNoFrontierConfiguredIsStale states the cost of leaving it out, rather than defaulting to fresh.
+func TestNoFrontierConfiguredIsStale(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+
+	decision, err := enforcerWith(t, active, nil, nil).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Stale {
+		t.Error("a consumer with no frontier certified itself fresh")
+	}
+}
+
+// TestACachedFrontierAgesRatherThanFreezing covers the arithmetic that a cache makes tempting to
+// skip: the producer observed its backlog at an instant that has passed, so the age it reported has
+// grown since.
+func TestACachedFrontierAgesRatherThanFreezing(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	// Owed for 40s as observed 40s ago: 80s in total, past the 60s window.
+	observed := time.Now().UTC().Add(-40 * time.Second)
+	stale := stubFrontier{facts: frontier.Facts{
+		OldestUnpublishedAge: 40 * time.Second,
+		Unpublished:          true,
+		ObservedAt:           observed,
+		ReadAt:               observed,
+	}}
+
+	decision, err := enforcerWith(t, active, nil, stale).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Stale {
+		t.Error("a frontier observed 40s ago reporting a 40s backlog was treated as inside a 60s window")
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return len(haystack) >= len(needle) && strings.Contains(haystack, needle)
 }

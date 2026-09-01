@@ -8,6 +8,7 @@ import (
 
 	"github.com/anshacerbia2/foundation-platform/id"
 
+	"github.com/anshacerbia2/foundation-reference/internal/frontier"
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
@@ -26,14 +27,25 @@ type Projection interface {
 	Lookup(ctx context.Context, tenantID, principalID id.UUID) (projection.Record, error)
 }
 
+// Frontier is the producer's publication state, which the consumer cannot derive for itself.
+//
+// An interface so the enforcer can be tested against a producer that owes an old delivery without one
+// existing -- the branch that matters most here is the one where the producer is behind, and provoking
+// that against a real outbox means arranging a stuck dispatcher.
+type Frontier interface {
+	Frontier(ctx context.Context) (frontier.Facts, error)
+}
+
 // Enforcer answers whether one operation may proceed, given its class.
 type Enforcer struct {
 	projector Projection
 	authority Authority
+	frontier  Frontier
 	maxAge    time.Duration
+	now       func() time.Time
 }
 
-func NewEnforcer(projector Projection, authority Authority, maxAge time.Duration) (*Enforcer, error) {
+func NewEnforcer(projector Projection, authority Authority, publication Frontier, maxAge time.Duration) (*Enforcer, error) {
 	if projector == nil {
 		return nil, ErrNoProjector
 	}
@@ -43,7 +55,16 @@ func NewEnforcer(projector Projection, authority Authority, maxAge time.Duration
 	// authority may be nil, and that is a deliberate configuration rather than a defect:
 	// a deployment with no authority configured can still serve LOW_RISK traffic. The two
 	// classes that need it are refused, which is the correct answer to "I cannot check".
-	return &Enforcer{projector: projector, authority: authority, maxAge: maxAge}, nil
+	// A nil frontier is a deployment that cannot ask the producer how far behind it is. Permitted,
+	// and it costs every projection-backed class its window: without the producer's facts the only
+	// honest answer about gaps is that they are unknown. See freshness below.
+	return &Enforcer{
+		projector: projector,
+		authority: authority,
+		frontier:  publication,
+		maxAge:    maxAge,
+		now:       time.Now,
+	}, nil
 }
 
 // Decide is the single place this consumer turns a class plus a projection state into an
@@ -107,11 +128,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		}, nil
 	}
 
-	// >= rather than > when the budget is zero, so a class declaring zero tolerance treats any
-	// projection as stale. With >, a budget of zero would admit an age of zero — which is only
-	// ever true of a projection that just applied something, so the class would pass or fail on
-	// whether an unrelated event happened to land in the same instant.
-	stale := ageErr != nil || age > policy.MaxStale || policy.MaxStale == 0
+	stale, staleBecause := e.stale(ctx, policy, age, ageErr)
 
 	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
@@ -135,14 +152,14 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		if policy.FailOpen {
 			return Decision{
 				Allow:  true,
-				Reason: e.staleReason(ageErr, age, policy.MaxStale) + ", and this class fails open",
+				Reason: staleBecause + ", and this class fails open",
 				Stale:  true,
 				Age:    age,
 			}, nil
 		}
 		return Decision{
 			Allow:  false,
-			Reason: e.staleReason(ageErr, age, policy.MaxStale) + ", and this class fails closed",
+			Reason: staleBecause + ", and this class fails closed",
 			Stale:  true,
 			Age:    age,
 		}, nil
@@ -185,13 +202,56 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 	}
 }
 
-func (e *Enforcer) staleReason(ageErr error, age, budget time.Duration) string {
+// stale composes the three things freshness depends on, and returns why.
+//
+// Two of the three are local hints and only one is sound about gaps:
+//
+//   - the consumer's own apply age, which answers "when did the last event land" and cannot see a
+//     delivery that never arrived;
+//   - the producer's oldest owed delivery, which is the only term that can, because a rolled-back
+//     sequence number was never in its outbox;
+//   - whether the producer could be reached at all, which is unknown rather than fine.
+//
+// Composed here rather than in the producer deliberately: the producer cannot see which operation is
+// being authorised, and the same lag is acceptable for a directory read and unacceptable for a
+// payroll one.
+func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, ageErr error) (bool, string) {
+	if policy.MaxStale == 0 {
+		// A class tolerating nothing does not need a measurement to refuse. Stated first so the
+		// network call below is not made for an answer that cannot change.
+		return true, "this class tolerates no staleness, and a projection is not an authoritative answer"
+	}
 	if ageErr != nil {
-		return "the projection's freshness is unknown"
+		return true, "the projection's freshness is unknown"
 	}
-	if budget == 0 {
-		return "this class tolerates no staleness, and a projection is not an authoritative answer"
+	if age > policy.MaxStale {
+		return true, fmt.Sprintf("the projection is %s old, past this class's %s bound",
+			age.Round(time.Millisecond), policy.MaxStale)
 	}
-	return fmt.Sprintf("the projection is %s old, past this class's %s bound",
-		age.Round(time.Millisecond), budget)
+
+	if e.frontier == nil {
+		// No producer facts configured, so gaps are unknowable. The consumer's own age cannot rule
+		// out a delivery that never arrived, so the honest answer is stale -- and the class decides
+		// what that costs. Reporting fresh here would be the original defect with extra steps: a
+		// consumer certifying itself current from information that cannot show it is not.
+		return true, "no publication frontier is configured, so an undelivered event cannot be ruled out"
+	}
+
+	facts, err := e.frontier.Frontier(ctx)
+	if err != nil {
+		return true, fmt.Sprintf("the publication frontier could not be read: %v", err)
+	}
+	if !facts.Unpublished {
+		return false, ""
+	}
+
+	// The producer observed its oldest owed delivery at an instant that has since passed, so the age
+	// it reported has grown by the time since. Ignoring that would let a cached answer certify
+	// freshness it can no longer support.
+	owed := facts.OldestUnpublishedAge + e.now().UTC().Sub(facts.ObservedAt)
+	if owed > policy.MaxStale {
+		return true, fmt.Sprintf("the producer has owed a delivery for %s, past this class's %s bound",
+			owed.Round(time.Millisecond), policy.MaxStale)
+	}
+	return false, ""
 }

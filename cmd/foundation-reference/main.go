@@ -24,6 +24,7 @@ import (
 	"github.com/anshacerbia2/foundation-platform/verify"
 
 	"github.com/anshacerbia2/foundation-reference/internal/config"
+	"github.com/anshacerbia2/foundation-reference/internal/frontier"
 	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
@@ -82,7 +83,26 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			slog.String("variable", "REFERENCE_AUTHORITY_BASE_URL"))
 	}
 
-	enforcer, err := httpapi.NewEnforcer(projector, authority, cfg.MaxProjectionAge)
+	// The publication frontier, from the same authority. Without it, every projection-backed class
+	// loses its window: the consumer's own age cannot rule out a delivery that never arrived, and
+	// certifying freshness from information that cannot show a gap is the defect this whole exchange
+	// was about.
+	//
+	// Cached for a quarter of the window, so a cache can only make an answer look older than it is.
+	var publication httpapi.Frontier
+	if cfg.AuthorityBaseURL != "" {
+		client, err := frontier.NewClient(cfg.AuthorityBaseURL, cfg.AuthorityToken,
+			cfg.AuthorityTimeout, cfg.MaxProjectionAge/4)
+		if err != nil {
+			return fmt.Errorf("frontier client: %w", err)
+		}
+		publication = client
+	} else {
+		logger.Warn("no publication frontier configured; every projection-backed class will refuse",
+			slog.String("variable", "REFERENCE_AUTHORITY_BASE_URL"))
+	}
+
+	enforcer, err := httpapi.NewEnforcer(projector, authority, publication, cfg.MaxProjectionAge)
 	if err != nil {
 		return fmt.Errorf("enforcer: %w", err)
 	}
