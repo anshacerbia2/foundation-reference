@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS projection.membership (
     event_id uuid NOT NULL
 );
 
+-- Enforcement asks about a (Tenant, Principal) pair, never about a membership identifier on its
+-- own: "may this principal act in this tenant" is the question a product has, and the membership
+-- is the authority's answer to it rather than the caller's input. Unique because one principal
+-- holds at most one active membership per tenant, and a second row would make the enforcement
+-- answer depend on which row was read.
+CREATE UNIQUE INDEX IF NOT EXISTS membership_context_key
+    ON projection.membership (tenant_id, principal_id);
+
 -- Freshness is read on every projection-backed enforcement check, so it must not be a
 -- sequential scan once this table is large.
 CREATE INDEX IF NOT EXISTS membership_applied_at_idx

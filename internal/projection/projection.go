@@ -32,7 +32,7 @@ import (
 )
 
 // MembershipRevoked is the event type this consumer enforces on.
-const MembershipRevoked event.Type = "com.scnehaux.organization.membership.revoked"
+const MembershipRevoked event.Type = "com.scnehaux.organization.membership.security.revoked"
 
 var (
 	ErrNoPool         = errors.New("projection: a pool is required")
@@ -166,11 +166,18 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 }
 
 const lookupStatement = `SELECT membership_id, tenant_id, principal_id, revoked, version, applied_at
-  FROM projection.membership WHERE membership_id = $1`
+  FROM projection.membership WHERE tenant_id = $1 AND principal_id = $2`
 
-// Lookup answers from the projection alone. Callers that must not depend on a replica ask
-// the authority instead; see internal/httpapi.
-func (p *Projector) Lookup(ctx context.Context, membershipID id.UUID) (Record, error) {
+// Lookup answers from the projection alone, keyed by the pair enforcement actually asks about.
+//
+// Not by membership identifier: `may this principal act in this tenant` is the question a
+// product has, and the membership is the authority's answer to it rather than the caller's
+// input. A caller that had to supply a membership_id would have to learn it from somewhere,
+// and the only place available is this replica -- so the check would depend on the replica
+// twice, including for the classes that must not depend on it at all.
+//
+// Callers that must not depend on a replica ask the authority instead; see internal/httpapi.
+func (p *Projector) Lookup(ctx context.Context, tenantID, principalID id.UUID) (Record, error) {
 	var record Record
 	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		// Query and Next rather than QueryRow: absence is an expected answer here, and
@@ -178,22 +185,22 @@ func (p *Projector) Lookup(ctx context.Context, membershipID id.UUID) (Record, e
 		// driver's own sentinel. "The membership is unknown to this consumer" and "the read
 		// broke" have to reach the caller as different things — the first is fail-open
 		// eligible, the second never is.
-		rows, err := tx.Query(ctx, lookupStatement, membershipID.String())
+		rows, err := tx.Query(ctx, lookupStatement, tenantID.String(), principalID.String())
 		if err != nil {
-			return fmt.Errorf("projection: reading %s: %w", membershipID, err)
+			return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
 		}
 		defer rows.Close()
 
 		if !rows.Next() {
 			if err := rows.Err(); err != nil {
-				return fmt.Errorf("projection: reading %s: %w", membershipID, err)
+				return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
 			}
 			return ErrNotProjected
 		}
 
 		var membership, tenant, principal string
 		if err := rows.Scan(&membership, &tenant, &principal, &record.Revoked, &record.Version, &record.AppliedAt); err != nil {
-			return fmt.Errorf("projection: scanning %s: %w", membershipID, err)
+			return fmt.Errorf("projection: scanning (%s, %s): %w", tenantID, principalID, err)
 		}
 		var parseErr error
 		if record.MembershipID, parseErr = id.Parse(membership); parseErr != nil {

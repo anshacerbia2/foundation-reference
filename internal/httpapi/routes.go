@@ -34,10 +34,10 @@ type Operation struct {
 // operations is the protected surface. Each class appears once so all four fail behaviours
 // are reachable by hand; a real product would have many routes per class.
 var operations = []Operation{
-	{http.MethodGet, "/v1/directory/{membership_id}", LowRisk},
-	{http.MethodGet, "/v1/payroll/{membership_id}", HighConfidentiality},
-	{http.MethodPost, "/v1/administration/{membership_id}", Privileged},
-	{http.MethodPost, "/v1/deletion/{membership_id}", Irreversible},
+	{http.MethodGet, "/v1/directory/{tenant_id}", LowRisk},
+	{http.MethodGet, "/v1/payroll/{tenant_id}", HighConfidentiality},
+	{http.MethodPost, "/v1/administration/{tenant_id}", Privileged},
+	{http.MethodPost, "/v1/deletion/{tenant_id}", Irreversible},
 }
 
 // Operations exposes the table for tests.
@@ -172,13 +172,30 @@ func Routes(cfg Config) (*Surface, error) {
 
 func protected(enforcer *Enforcer, operation Operation) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		membershipID, err := id.Parse(r.PathValue("membership_id"))
+		tenantID, err := id.Parse(r.PathValue("tenant_id"))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "membership_id is not a UUID"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tenant_id is not a UUID"})
 			return
 		}
 
-		decision, err := enforcer.Decide(r.Context(), operation.Class, membershipID)
+		// The principal comes from the authenticated token, never from the path. A caller who
+		// could name the principal could ask about somebody else's access -- and on the classes
+		// that consult the authority, could use this service as an oracle for whether an
+		// arbitrary principal holds context in an arbitrary tenant.
+		caller, ok := CallerFrom(r.Context())
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no authenticated caller"})
+			return
+		}
+		principalID, err := id.Parse(caller.Subject)
+		if err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "the token subject is not a principal identifier",
+			})
+			return
+		}
+
+		decision, err := enforcer.Decide(r.Context(), operation.Class, tenantID, principalID)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"operation": operation.Pattern,

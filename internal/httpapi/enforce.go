@@ -11,14 +11,6 @@ import (
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
-// Authority is what this consumer needs from organization-control for the classes that may
-// not read a replica. The interface is declared here, by the caller, so the HTTP client that
-// satisfies it stays one adapter.
-type Authority interface {
-	// MembershipValid answers authoritatively. An error means "unknown", never "valid".
-	MembershipValid(ctx context.Context, membershipID id.UUID) (bool, error)
-}
-
 var ErrNoProjector = errors.New("httpapi: a projector is required")
 
 // Projection is the narrow view the enforcer needs, declared here rather than beside the
@@ -31,7 +23,7 @@ var ErrNoProjector = errors.New("httpapi: a projector is required")
 // fail-open admits a revoked caller.
 type Projection interface {
 	Age(ctx context.Context) (time.Duration, error)
-	Lookup(ctx context.Context, membershipID id.UUID) (projection.Record, error)
+	Lookup(ctx context.Context, tenantID, principalID id.UUID) (projection.Record, error)
 }
 
 // Enforcer answers whether one operation may proceed, given its class.
@@ -57,19 +49,19 @@ func NewEnforcer(projector Projection, authority Authority, maxAge time.Duration
 // Decide is the single place this consumer turns a class plus a projection state into an
 // answer. Every route goes through it, so there is no handler that quietly reads the
 // projection directly.
-func (e *Enforcer) Decide(ctx context.Context, class Class, membershipID id.UUID) (Decision, error) {
+func (e *Enforcer) Decide(ctx context.Context, class Class, tenantID, principalID id.UUID) (Decision, error) {
 	policy, err := PolicyFor(class)
 	if err != nil {
 		return Decision{}, err
 	}
 
 	if !policy.UsesProjection {
-		return e.decideFromAuthority(ctx, class, membershipID)
+		return e.decideFromAuthority(ctx, class, tenantID, principalID)
 	}
-	return e.decideFromProjection(ctx, policy, membershipID)
+	return e.decideFromProjection(ctx, policy, tenantID, principalID)
 }
 
-func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, membershipID id.UUID) (Decision, error) {
+func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantID, principalID id.UUID) (Decision, error) {
 	if e.authority == nil {
 		return Decision{
 			Allow:  false,
@@ -77,27 +69,31 @@ func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, members
 		}, nil
 	}
 
-	valid, err := e.authority.MembershipValid(ctx, membershipID)
+	verdict, err := e.authority.Verify(ctx, tenantID, principalID)
 	if err != nil {
-		// Unreachable authority is a refusal, not a fallback to the projection. Falling
-		// back would make the classes that exist to avoid the replica depend on it exactly
-		// when the estate is degraded.
+		// Unreachable authority is a refusal, not a fallback to the projection. Falling back
+		// would make the classes that exist to avoid the replica depend on it exactly when the
+		// estate is degraded.
 		return Decision{
 			Allow:  false,
 			Reason: fmt.Sprintf("the authority could not be reached: %v", err),
 		}, nil
 	}
-	if !valid {
-		return Decision{Allow: false, Reason: "the authority reports this membership is not valid"}, nil
+	if !verdict.Granted {
+		return Decision{Allow: false, Reason: "the authority does not grant this context"}, nil
 	}
-	return Decision{Allow: true, Reason: "confirmed by the authority"}, nil
+	return Decision{
+		Allow: true,
+		Reason: fmt.Sprintf("granted by the authority at membership version %d, tenant security version %d",
+			verdict.MembershipVersion, verdict.TenantSecurityVersion),
+	}, nil
 }
 
-func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, membershipID id.UUID) (Decision, error) {
+func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tenantID, principalID id.UUID) (Decision, error) {
 	age, ageErr := e.projector.Age(ctx)
 	stale := ageErr != nil || age > e.maxAge
 
-	record, err := e.projector.Lookup(ctx, membershipID)
+	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
 	case err == nil && record.Revoked:
 		// A revocation that has been applied is enforced regardless of class or freshness.

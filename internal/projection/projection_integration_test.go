@@ -65,13 +65,28 @@ func newID(t *testing.T) id.UUID {
 	return minted
 }
 
-func revoked(t *testing.T, membershipID id.UUID, version int64) event.Envelope {
+// subject is one (Tenant, Principal, Membership) triple, held together because enforcement asks
+// about the pair while the event carries all three. Minting fresh tenant and principal
+// identifiers per envelope would make two deliveries for the same membership describe two
+// different contexts, and the monotonicity guard would then compare unrelated rows.
+type subject struct {
+	tenant     id.UUID
+	principal  id.UUID
+	membership id.UUID
+}
+
+func newSubject(t *testing.T) subject {
+	t.Helper()
+	return subject{tenant: newID(t), principal: newID(t), membership: newID(t)}
+}
+
+func revoked(t *testing.T, s subject, version int64) event.Envelope {
 	t.Helper()
 
 	payload := projection.Payload{
-		MembershipID: membershipID,
-		TenantID:     newID(t),
-		PrincipalID:  newID(t),
+		MembershipID: s.membership,
+		TenantID:     s.tenant,
+		PrincipalID:  s.principal,
 		Version:      version,
 	}
 	envelope, err := event.New(source, projection.MembershipRevoked, time.Now().UTC(), payload)
@@ -86,9 +101,9 @@ func revoked(t *testing.T, membershipID id.UUID, version int64) event.Envelope {
 
 func TestApplyingARevocationProjectsIt(t *testing.T) {
 	projector, _, ctx := fixture(t)
-	membershipID := newID(t)
+	s := newSubject(t)
 
-	outcome, err := projector.Apply(ctx, revoked(t, membershipID, 3))
+	outcome, err := projector.Apply(ctx, revoked(t, s, 3))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -97,7 +112,7 @@ func TestApplyingARevocationProjectsIt(t *testing.T) {
 			outcome.Applied, outcome.Duplicate, outcome.Superseded)
 	}
 
-	record, err := projector.Lookup(ctx, membershipID)
+	record, err := projector.Lookup(ctx, s.tenant, s.principal)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -110,8 +125,8 @@ func TestApplyingARevocationProjectsIt(t *testing.T) {
 // broker at-least-once delivery does.
 func TestADuplicateDeliveryAppliesNothingTwice(t *testing.T) {
 	projector, pool, ctx := fixture(t)
-	membershipID := newID(t)
-	envelope := revoked(t, membershipID, 4)
+	s := newSubject(t)
+	envelope := revoked(t, s, 4)
 
 	first, err := projector.Apply(ctx, envelope)
 	if err != nil {
@@ -137,7 +152,7 @@ func TestADuplicateDeliveryAppliesNothingTwice(t *testing.T) {
 	if err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx,
 			`SELECT count(*) FROM projection.membership WHERE membership_id = $1`,
-			membershipID.String()).Scan(&rows)
+			s.membership.String()).Scan(&rows)
 	}); err != nil {
 		t.Fatalf("counting: %v", err)
 	}
@@ -153,13 +168,13 @@ func TestADuplicateDeliveryAppliesNothingTwice(t *testing.T) {
 // regress the state.
 func TestOutOfOrderDeliveryIsHarmless(t *testing.T) {
 	projector, _, ctx := fixture(t)
-	membershipID := newID(t)
+	s := newSubject(t)
 
-	if _, err := projector.Apply(ctx, revoked(t, membershipID, 9)); err != nil {
+	if _, err := projector.Apply(ctx, revoked(t, s, 9)); err != nil {
 		t.Fatalf("applying version 9: %v", err)
 	}
 
-	late, err := projector.Apply(ctx, revoked(t, membershipID, 5))
+	late, err := projector.Apply(ctx, revoked(t, s, 5))
 	if err != nil {
 		t.Fatalf("applying version 5: %v", err)
 	}
@@ -168,7 +183,7 @@ func TestOutOfOrderDeliveryIsHarmless(t *testing.T) {
 			late.Applied, late.Duplicate, late.Superseded)
 	}
 
-	record, err := projector.Lookup(ctx, membershipID)
+	record, err := projector.Lookup(ctx, s.tenant, s.principal)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -179,12 +194,12 @@ func TestOutOfOrderDeliveryIsHarmless(t *testing.T) {
 
 func TestANewerDeliveryAdvancesTheVersion(t *testing.T) {
 	projector, _, ctx := fixture(t)
-	membershipID := newID(t)
+	s := newSubject(t)
 
-	if _, err := projector.Apply(ctx, revoked(t, membershipID, 2)); err != nil {
+	if _, err := projector.Apply(ctx, revoked(t, s, 2)); err != nil {
 		t.Fatalf("applying version 2: %v", err)
 	}
-	advanced, err := projector.Apply(ctx, revoked(t, membershipID, 11))
+	advanced, err := projector.Apply(ctx, revoked(t, s, 11))
 	if err != nil {
 		t.Fatalf("applying version 11: %v", err)
 	}
@@ -192,7 +207,7 @@ func TestANewerDeliveryAdvancesTheVersion(t *testing.T) {
 		t.Error("a newer version did not apply")
 	}
 
-	record, err := projector.Lookup(ctx, membershipID)
+	record, err := projector.Lookup(ctx, s.tenant, s.principal)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -204,8 +219,8 @@ func TestANewerDeliveryAdvancesTheVersion(t *testing.T) {
 func TestAnUnknownEventTypeIsRefusedRatherThanIgnored(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
-	envelope := revoked(t, newID(t), 1)
-	envelope.Type = "com.scnehaux.organization.membership.granted"
+	envelope := revoked(t, newSubject(t), 1)
+	envelope.Type = "com.scnehaux.organization.membership.lifecycle.granted"
 
 	// Refused, not silently skipped: a consumer that swallows an unrecognised type reports
 	// success for work it never did, and the dispatcher marks the row published.
@@ -217,7 +232,7 @@ func TestAnUnknownEventTypeIsRefusedRatherThanIgnored(t *testing.T) {
 func TestAMalformedPayloadIsRefused(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
-	envelope := revoked(t, newID(t), 1)
+	envelope := revoked(t, newSubject(t), 1)
 	envelope.Data = json.RawMessage(`{"membership_id":"11111111-1111-4111-8111-11111111111a","version":0}`)
 
 	if _, err := projector.Apply(ctx, envelope); err == nil {
@@ -230,7 +245,7 @@ func TestAMalformedPayloadIsRefused(t *testing.T) {
 func TestAgeReportsHowStaleTheAnswerIs(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
-	if _, err := projector.Apply(ctx, revoked(t, newID(t), 1)); err != nil {
+	if _, err := projector.Apply(ctx, revoked(t, newSubject(t), 1)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 

@@ -72,7 +72,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// which is the correct answer to "I cannot check".
 	var authority httpapi.Authority
 	if cfg.AuthorityBaseURL != "" {
-		authority, err = httpapi.NewAuthorityClient(cfg.AuthorityBaseURL, cfg.AuthorityTimeout)
+		authority, err = httpapi.NewAuthorityClient(
+			cfg.AuthorityBaseURL, cfg.ConsumerName, cfg.AuthorityToken, cfg.AuthorityTimeout)
 		if err != nil {
 			return fmt.Errorf("authority client: %w", err)
 		}

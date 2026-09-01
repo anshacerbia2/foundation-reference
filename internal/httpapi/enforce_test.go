@@ -29,19 +29,21 @@ func (s stubProjection) Age(context.Context) (time.Duration, error) {
 	return s.age, s.ageErr
 }
 
-func (s stubProjection) Lookup(context.Context, id.UUID) (projection.Record, error) {
+func (s stubProjection) Lookup(context.Context, id.UUID, id.UUID) (projection.Record, error) {
 	return s.record, s.lookupErr
 }
 
 type stubAuthority struct {
-	valid bool
-	err   error
+	granted bool
+	err     error
 }
 
-func (s stubAuthority) MembershipValid(context.Context, id.UUID) (bool, error) {
-	return s.valid, s.err
+func (s stubAuthority) Verify(context.Context, id.UUID, id.UUID) (httpapi.Verdict, error) {
+	return httpapi.Verdict{Granted: s.granted, MembershipVersion: 4, TenantSecurityVersion: 1}, s.err
 }
 
+// membership returns a fixture identifier used for both the tenant and the principal: the
+// enforcer treats them as opaque, and using one value keeps the call sites readable.
 func membership(t *testing.T) id.UUID {
 	t.Helper()
 	parsed, err := id.Parse("11111111-1111-4111-8111-11111111111a")
@@ -71,7 +73,7 @@ func TestAnAppliedRevocationIsEnforcedForEveryClass(t *testing.T) {
 	}
 
 	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
-		decision, err := enforcer(t, stub, nil).Decide(context.Background(), class, membership(t))
+		decision, err := enforcer(t, stub, nil).Decide(context.Background(), class, membership(t), membership(t))
 		if err != nil {
 			t.Fatalf("%s: Decide: %v", class, err)
 		}
@@ -85,7 +87,7 @@ func TestLowRiskFailsOpenOnlyWithinTheBound(t *testing.T) {
 	fresh := stubProjection{age: 30 * time.Second, lookupErr: projection.ErrNotProjected}
 	stale := stubProjection{age: 10 * time.Minute, lookupErr: projection.ErrNotProjected}
 
-	within, err := enforcer(t, fresh, nil).Decide(context.Background(), httpapi.LowRisk, membership(t))
+	within, err := enforcer(t, fresh, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide within the bound: %v", err)
 	}
@@ -94,7 +96,7 @@ func TestLowRiskFailsOpenOnlyWithinTheBound(t *testing.T) {
 			within.Allow, within.Stale)
 	}
 
-	past, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.LowRisk, membership(t))
+	past, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide past the bound: %v", err)
 	}
@@ -111,7 +113,7 @@ func TestLowRiskFailsOpenOnlyWithinTheBound(t *testing.T) {
 func TestHighConfidentialityFailsClosedPastTheBound(t *testing.T) {
 	stale := stubProjection{age: 10 * time.Minute, lookupErr: projection.ErrNotProjected}
 
-	decision, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t))
+	decision, err := enforcer(t, stale, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
@@ -128,7 +130,7 @@ func TestABrokenReadNeverFailsOpen(t *testing.T) {
 	broken := stubProjection{age: time.Second, lookupErr: errors.New("connection reset by peer")}
 
 	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
-		decision, err := enforcer(t, broken, nil).Decide(context.Background(), class, membership(t))
+		decision, err := enforcer(t, broken, nil).Decide(context.Background(), class, membership(t), membership(t))
 		if err == nil {
 			t.Errorf("%s: a broken read returned no error", class)
 		}
@@ -147,10 +149,10 @@ func TestPrivilegedClassesNeverReadTheProjection(t *testing.T) {
 		age:    time.Second,
 		record: projection.Record{MembershipID: membership(t), Revoked: true, Version: 9},
 	}
-	authority := stubAuthority{valid: true}
+	authority := stubAuthority{granted: true}
 
 	for _, class := range []httpapi.Class{httpapi.Privileged, httpapi.Irreversible} {
-		decision, err := enforcer(t, contradicting, authority).Decide(context.Background(), class, membership(t))
+		decision, err := enforcer(t, contradicting, authority).Decide(context.Background(), class, membership(t), membership(t))
 		if err != nil {
 			t.Fatalf("%s: Decide: %v", class, err)
 		}
@@ -167,7 +169,7 @@ func TestAnUnreachableAuthorityRefusesRatherThanFallingBack(t *testing.T) {
 	permissive := stubProjection{age: time.Second, lookupErr: projection.ErrNotProjected}
 	unreachable := stubAuthority{err: errors.New("dial tcp: connection refused")}
 
-	decision, err := enforcer(t, permissive, unreachable).Decide(context.Background(), httpapi.Privileged, membership(t))
+	decision, err := enforcer(t, permissive, unreachable).Decide(context.Background(), httpapi.Privileged, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
@@ -179,7 +181,7 @@ func TestAnUnreachableAuthorityRefusesRatherThanFallingBack(t *testing.T) {
 func TestAMissingAuthorityRefusesThePrivilegedClasses(t *testing.T) {
 	permissive := stubProjection{age: time.Second, lookupErr: projection.ErrNotProjected}
 
-	decision, err := enforcer(t, permissive, nil).Decide(context.Background(), httpapi.Irreversible, membership(t))
+	decision, err := enforcer(t, permissive, nil).Decide(context.Background(), httpapi.Irreversible, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
@@ -191,7 +193,7 @@ func TestAMissingAuthorityRefusesThePrivilegedClasses(t *testing.T) {
 func TestAColdProjectionFollowsTheClassPolicy(t *testing.T) {
 	cold := stubProjection{ageErr: projection.ErrProjectionCold, lookupErr: projection.ErrProjectionCold}
 
-	open, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.LowRisk, membership(t))
+	open, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide LOW_RISK: %v", err)
 	}
@@ -199,7 +201,7 @@ func TestAColdProjectionFollowsTheClassPolicy(t *testing.T) {
 		t.Error("LOW_RISK on a cold projection was refused; this class fails open")
 	}
 
-	closed, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t))
+	closed, err := enforcer(t, cold, nil).Decide(context.Background(), httpapi.HighConfidentiality, membership(t), membership(t))
 	if err != nil {
 		t.Fatalf("Decide HIGH_CONFIDENTIALITY: %v", err)
 	}

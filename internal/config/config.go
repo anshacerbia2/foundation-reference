@@ -44,6 +44,15 @@ type Config struct {
 
 	AuthorityTimeout time.Duration
 
+	// AuthorityToken is the credential this consumer presents to the fresh check.
+	//
+	// Today POST /v1/context/verify is gated by provider authority, which is far broader than
+	// what a consumer asking about one (Tenant, Principal) needs -- provider authority also
+	// mutates every Tenant in the estate. Held here as one value so the narrowing, when
+	// organization-control grows a consumer-scoped authority, is a configuration change rather
+	// than a code change. Recorded as debt, not accepted as correct.
+	AuthorityToken string
+
 	// Token verification. Required rather than optional: this deployable writes a projection
 	// that decides whether other people's operations proceed, and a build that can start
 	// without a verifier is a build that can be deployed with authentication switched off.
@@ -73,6 +82,10 @@ func Load() (Config, error) {
 	cfg.ConsumerName = stringOr("REFERENCE_CONSUMER_NAME", Deployable)
 	cfg.ListenAddress = stringOr("REFERENCE_LISTEN_ADDRESS", "127.0.0.1:8096")
 	cfg.AuthorityBaseURL = strings.TrimSpace(os.Getenv("REFERENCE_AUTHORITY_BASE_URL"))
+	cfg.AuthorityToken = strings.TrimSpace(os.Getenv("REFERENCE_AUTHORITY_TOKEN"))
+	if cfg.AuthorityBaseURL != "" && cfg.AuthorityToken == "" {
+		problems = append(problems, errors.New("REFERENCE_AUTHORITY_TOKEN is required when an authority is configured: an unauthenticated fresh check would be refused per request rather than at startup"))
+	}
 	cfg.LogLevel = stringOr("LOG_LEVEL", "info")
 
 	cfg.TokenIssuer = strings.TrimSpace(os.Getenv("REFERENCE_TOKEN_ISSUER"))
