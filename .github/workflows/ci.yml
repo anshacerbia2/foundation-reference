@@ -125,6 +125,57 @@ jobs:
       # success, but the failure was in this file rather than in the code. Loose matching costs
       # nothing (the not-found branch below still catches a real disappearance) and removes a class
       # of red build that teaches people to distrust the gate.
+      # The two enforcement guards, mutated the same way and for the same reason.
+      #
+      # Both replaced a permissive branch with a refusal, and a refusal is invisible in a green
+      # build: a suite that would pass with the permissive branch restored is a suite that does not
+      # test the correction. These steps restore each one and require the suite to notice.
+      #
+      # Written as gates rather than trusted to review because the change they guard is the one
+      # somebody makes at 4pm to clear an incident, and it makes every symptom disappear.
+      - name: no class serves past its bound
+        run: |
+          file=internal/httpapi/enforce.go
+          cp "$file" "$file.orig"
+          # Serve the active row whether or not it is stale, which is what fail-open did. Mutating
+          # the guard rather than the Decision literal keeps this a single-line, single-occurrence
+          # substitution: the branch below it is several lines of comment away from its own fields.
+          sed -i -E 's/if !stale \{/if true {/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the freshness guard was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/httpapi -count=1 \
+              -run 'TestLowRiskIsBoundedRatherThanFailOpen|TestAProducerBehindItsBudgetMakesTheConsumerStale|TestHighConfidentialityRefusesAStaleActiveAnswer'; then
+            echo "::error::the suite passed with fail-open restored, so it does not test the bound"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the bound is load-bearing: restoring fail-open fails the enforcement tests"
+          mv "$file.orig" "$file"
+
+      - name: the producer's dead-letter debt is load-bearing
+        run: |
+          file=internal/httpapi/enforce.go
+          cp "$file" "$file.orig"
+          # Stop consulting the debt, which is exactly the state the correction closed: the producer
+          # reports nothing owed because the revocation left the owed pool when it was abandoned.
+          sed -i -E 's/if facts\.SecurityDebt \{/if false \&\& facts.SecurityDebt {/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the dead-letter debt check was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/httpapi -count=1 \
+              -run 'TestAnUnresolvedSecurityDeadLetterRefusesEveryProjectionBackedClass|TestADeadLetterDebtIsOutsideEveryBudget'; then
+            echo "::error::the suite passed while the abandoned-delivery debt was ignored"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the debt is load-bearing: ignoring it fails the abandoned-delivery tests"
+          mv "$file.orig" "$file"
+
       - name: the monotonicity guard is load-bearing
         run: |
           file=internal/projection/projection.go

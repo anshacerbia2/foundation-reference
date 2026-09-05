@@ -2,6 +2,8 @@ package httpapi_test
 
 import (
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,19 +58,39 @@ func TestThePolicyTableCoversEveryClass(t *testing.T) {
 	}
 }
 
-// TestOnlyLowRiskFailsOpen states the policy as an assertion rather than as prose.
+// TestNoClassFailsOpen is what replaced TestOnlyLowRiskFailsOpen, and the replacement is the
+// principal review's third P0 correction rather than a rename.
 //
-// This is the test that fails if somebody widens fail-open, which is the change most likely
-// to be made under delivery pressure and least likely to be noticed in review: it makes
-// every symptom disappear.
-func TestOnlyLowRiskFailsOpen(t *testing.T) {
+// The predecessor asserted that exactly one class carried FailOpen. It passed for as long as the
+// field existed, which was the problem: it protected the boundary of fail-open and never asked
+// whether the one class inside it should be there. It should not have been -- a bound that expires
+// into permission bounds nothing, so a late revocation was refused for sixty seconds and permitted
+// forever after.
+//
+// The field is gone, so the assertion is now about the type: no policy may carry a way to serve past
+// its budget. Reintroducing one fails here, and reintroducing it under a different name fails
+// TestLowRiskIsBoundedRatherThanFailOpen and TestAProducerBehindItsBudgetMakesTheConsumerStale, which
+// assert the behaviour rather than the shape.
+func TestNoClassFailsOpen(t *testing.T) {
+	policy := reflect.TypeOf(httpapi.Policy{})
+	for i := 0; i < policy.NumField(); i++ {
+		name := policy.Field(i).Name
+		if strings.Contains(strings.ToLower(name), "failopen") {
+			t.Errorf("Policy carries a %s field again; a class that may answer past its budget has "+
+				"a budget that bounds nothing", name)
+		}
+	}
+
+	// What is left is one axis, and it must agree with the class's declared behaviour: a positive
+	// budget is permission to answer from the projection inside it, and zero is no permission at all.
 	for _, class := range httpapi.Classes() {
-		policy, err := httpapi.PolicyFor(class)
+		p, err := httpapi.PolicyFor(class)
 		if err != nil {
 			t.Fatalf("PolicyFor(%s): %v", class, err)
 		}
-		if policy.FailOpen != (class == httpapi.LowRisk) {
-			t.Errorf("%s: FailOpen = %v; only LOW_RISK may fail open", class, policy.FailOpen)
+		if serves := p.FromConfig(60 * time.Second).ServesFromProjection(); serves != (class == httpapi.LowRisk) {
+			t.Errorf("%s: ServesFromProjection = %v; LOW_RISK is the only class that may answer from "+
+				"the projection, and only inside its bound", class, serves)
 		}
 	}
 }
@@ -106,21 +128,25 @@ func TestBehaviourAgreesWithTheFailurePolicy(t *testing.T) {
 			t.Fatalf("PolicyFor(%s): %v", class, err)
 		}
 
+		// The configured window is applied first, because use_with_marker's budget comes from
+		// configuration and a policy read without it carries the placeholder.
+		policy = policy.FromConfig(60 * time.Second)
+
 		switch policy.Behavior {
 		case httpapi.UseWithMarker:
-			if !policy.FailOpen || !policy.UsesProjection {
-				t.Errorf("%s is use_with_marker but does not serve from the projection", class)
+			if !policy.ServesFromProjection() {
+				t.Errorf("%s is use_with_marker but cannot serve from the projection at all", class)
 			}
 		case httpapi.FailClosed:
-			if policy.FailOpen || !policy.UsesProjection {
-				t.Errorf("%s is fail_closed but fails open or bypasses the projection", class)
+			if !policy.UsesProjection {
+				t.Errorf("%s is fail_closed but bypasses the projection", class)
+			}
+			if policy.ServesFromProjection() {
+				t.Errorf("%s is fail_closed and still has a window to answer from the projection in", class)
 			}
 		case httpapi.Revalidate:
-			if policy.UsesProjection {
+			if policy.UsesProjection || policy.ServesFromProjection() {
 				t.Errorf("%s is revalidate but reads the projection instead of the authority", class)
-			}
-			if policy.FailOpen {
-				t.Errorf("%s is revalidate and fails open; an unrevalidated call must be refused", class)
 			}
 		default:
 			t.Errorf("%s carries behaviour %q, which is not one the registry declares", class, policy.Behavior)

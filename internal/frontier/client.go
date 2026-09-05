@@ -34,6 +34,26 @@ type Facts struct {
 	// since the epoch".
 	Unpublished bool
 
+	// SecurityDeadLettered and OldestSecurityDeadLetterAge are the deliveries the producer has
+	// stopped attempting: authority-bearing events sitting unresolved in its dead-letter table.
+	//
+	// They are not part of the owed pool and must not be treated as if they were. A row in the pool
+	// will arrive, so ageing it against a budget is a sound thing to do. A dead-lettered row will not
+	// arrive without an operator, so no budget makes it acceptable — and it left the pool precisely
+	// so that one poison event would not report the producer as owing a delivery forever.
+	//
+	// Which is why the consumer needs them separately: without these, the producer's answer for a
+	// dead-lettered Membership revocation is "nothing owed", and this consumer would keep serving a
+	// principal whose revocation is sitting in a table nobody is reading.
+	SecurityDeadLettered        int64
+	OldestSecurityDeadLetterAge time.Duration
+
+	// SecurityDebt is false when nothing authority-bearing is unresolved, for the same reason
+	// Unpublished exists.
+	SecurityDebt bool
+
+	// ObservedAt is the producer's own instant, on the producer's clock. It is reported for
+	// operators and is deliberately not used in any subtraction on this side — see Age.
 	ObservedAt time.Time
 
 	// ReadAt is when this consumer received the answer, which is not when the producer observed it.
@@ -54,7 +74,17 @@ type response struct {
 	OldestUnpublishedMark       int64   `json:"oldest_unpublished_mark"`
 	OldestUnpublishedAgeSeconds float64 `json:"oldest_unpublished_age_seconds"`
 	Unpublished                 bool    `json:"unpublished"`
-	ObservedAt                  string  `json:"observed_at"`
+
+	SecurityDeadLettered               int64   `json:"security_dead_lettered"`
+	OldestSecurityDeadLetterAgeSeconds float64 `json:"oldest_security_dead_letter_age_seconds"`
+
+	// A pointer, so an answer that omits the field is distinguishable from one reporting no debt.
+	// Absent means the producer predates the debt contract, and decoding that to false would be the
+	// worst kind of compatibility: an older producer silently certifying that it has given up on
+	// nothing. Refused in read, the same way an unparseable observed_at is.
+	SecurityDebt *bool `json:"security_debt"`
+
+	ObservedAt string `json:"observed_at"`
 }
 
 // Client reads the frontier, caching it for a short interval.
@@ -160,13 +190,28 @@ func (c *Client) read(ctx context.Context, now time.Time) (Facts, error) {
 		// aged, and treating it as current is the one interpretation that is never safe.
 		return Facts{}, fmt.Errorf("frontier: observed_at is not a timestamp: %w", err)
 	}
+	if decoded.SecurityDebt == nil {
+		// The same refusal, for the same reason. A producer that does not report its dead-letter debt
+		// is a producer whose "nothing owed" cannot be trusted, because the one state that matters
+		// most — a revocation it has stopped trying to deliver — is exactly the one that leaves the
+		// owed pool. Reading the absent field as false would restore the defect this contract exists
+		// to close, and it would do so silently at the next deployment skew.
+		return Facts{}, errors.New(
+			"frontier: the answer carries no security_dead_lettered debt, so the producer's " +
+				"undeliverable events cannot be ruled out")
+	}
 
 	return Facts{
 		HighestCommittedMark:  decoded.HighestCommittedMark,
 		OldestUnpublishedMark: decoded.OldestUnpublishedMark,
 		OldestUnpublishedAge:  time.Duration(decoded.OldestUnpublishedAgeSeconds * float64(time.Second)),
 		Unpublished:           decoded.Unpublished,
-		ObservedAt:            observed.UTC(),
-		ReadAt:                now,
+
+		SecurityDeadLettered:        decoded.SecurityDeadLettered,
+		OldestSecurityDeadLetterAge: time.Duration(decoded.OldestSecurityDeadLetterAgeSeconds * float64(time.Second)),
+		SecurityDebt:                *decoded.SecurityDebt,
+
+		ObservedAt: observed.UTC(),
+		ReadAt:     now,
 	}, nil
 }

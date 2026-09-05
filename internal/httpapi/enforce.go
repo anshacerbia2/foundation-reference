@@ -149,17 +149,23 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 				Age:    age,
 			}, nil
 		}
-		if policy.FailOpen {
-			return Decision{
-				Allow:  true,
-				Reason: staleBecause + ", and this class fails open",
-				Stale:  true,
-				Age:    age,
-			}, nil
-		}
+		// Past the bound, every class refuses. There is no fail-open branch here any more, and its
+		// removal is the third of the principal review's P0 corrections.
+		//
+		// The branch that stood here served the stale active row and marked the answer stale. The
+		// marker made the degradation visible and changed nothing about the access, so on the one
+		// path where lag actually matters the bound was advisory: a revocation that arrives late was
+		// refused for the length of the window and permitted from then on. A bound that expires into
+		// permission is not a bound.
+		//
+		// What that costs is real and is the correct cost: a LOW_RISK read is refused while this
+		// consumer cannot vouch for its model. That is availability spent on a caller whose authority
+		// this side cannot currently establish, which is the trade the class exists to make -- and it
+		// is bounded by the producer draining its outbox and by an operator resolving its debt, both
+		// of which are visible in the reason.
 		return Decision{
 			Allow:  false,
-			Reason: staleBecause + ", and this class fails closed",
+			Reason: staleBecause + ", and no class serves past its bound",
 			Stale:  true,
 			Age:    age,
 		}, nil
@@ -202,14 +208,16 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 	}
 }
 
-// stale composes the three things freshness depends on, and returns why.
+// stale composes the four things freshness depends on, and returns why.
 //
-// Two of the three are local hints and only one is sound about gaps:
+// Only the local one is a hint; the rest are facts this side cannot derive:
 //
 //   - the consumer's own apply age, which answers "when did the last event land" and cannot see a
 //     delivery that never arrived;
-//   - the producer's oldest owed delivery, which is the only term that can, because a rolled-back
-//     sequence number was never in its outbox;
+//   - the producer's oldest owed delivery, which can, because a rolled-back sequence number was
+//     never in its outbox;
+//   - the producer's unresolved authority-bearing dead letters, which are the deliveries it has
+//     stopped attempting -- outside every budget, because no amount of waiting settles them;
 //   - whether the producer could be reached at all, which is unknown rather than fine.
 //
 // Composed here rather than in the producer deliberately: the producer cannot see which operation is
@@ -256,6 +264,34 @@ func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, 
 	if err != nil {
 		return true, fmt.Sprintf("the publication frontier could not be read: %v", err)
 	}
+
+	// The producer's dead-letter debt, before the owed pool and outside every budget.
+	//
+	// It is checked first because it is the one term no amount of waiting settles. An unpublished row
+	// will be delivered, so comparing its age against a budget is a sound thing to do. A
+	// dead-lettered row has been given up on: it left the owed pool by design -- otherwise one poison
+	// event would report the producer as owing a delivery forever -- and nothing but an operator will
+	// move it. Ageing it against MaxStale would say a revocation nobody will ever deliver becomes
+	// acceptable once it is old enough, which is the exact inversion of what age means here.
+	//
+	// This was the second of the principal review's P0 corrections, and the gap it closed was total
+	// rather than partial: with the debt unreported, a poison Membership revocation left the producer
+	// answering "nothing owed" and every local signal on this side reading fresh, while this
+	// consumer held an active row that the revocation existed to withdraw. Not a stale answer -- a
+	// confidently fresh wrong one.
+	//
+	// The cost is that one unresolved authority-bearing dead letter refuses every projection-backed
+	// read until an operator clears it. That is deliberate: platform.dead_letter exists to force
+	// escalation rather than to accumulate undelivered security events, and a consumer that kept
+	// serving would be the reason nobody ever looked at the table. The producer scopes the count to
+	// the Membership events authority depends on, so an unrelated poison event does not do this.
+	if facts.SecurityDebt {
+		return true, fmt.Sprintf(
+			"the producer has given up on %d authority-bearing delivery(s), the oldest %s ago, "+
+				"and no delivery is owed for them", facts.SecurityDeadLettered,
+			facts.OldestSecurityDeadLetterAge.Round(time.Second))
+	}
+
 	if !facts.Unpublished {
 		return false, ""
 	}

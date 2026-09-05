@@ -29,7 +29,7 @@ help:
 	@echo.
 	@echo   Enforcement, by hand -- the four classes differ only in what they do
 	@echo   when the projection cannot answer:
-	@echo     GET  /v1/directory/{id}        LOW_RISK             fail-open, bounded
+	@echo     GET  /v1/directory/{id}        LOW_RISK             bounded; refused past it
 	@echo     GET  /v1/payroll/{id}          HIGH_CONFIDENTIALITY fail-closed
 	@echo     POST /v1/administration/{id}   PRIVILEGED           asks the authority
 	@echo     POST /v1/deletion/{id}         IRREVERSIBLE         asks the authority
