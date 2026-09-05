@@ -47,10 +47,17 @@ the real-world failure:
 
 ## Security classes, not HTTP methods
 
-The fail-open/fail-closed decision is made per **operation security class**, declared at the
-route. `GET /payroll` and `GET /passport` are reads with higher confidentiality impact than
-most writes, so a policy keyed on read-versus-write is wrong exactly where being wrong costs
-most.
+How much lag an operation may be authorised across is decided per **operation security class**,
+declared at the route. `GET /payroll` and `GET /passport` are reads with higher confidentiality
+impact than most writes, so a policy keyed on read-versus-write is wrong exactly where being
+wrong costs most.
+
+**No class fails open.** There was one — `LOW_RISK` served a stale answer and marked it — and
+the marker is what made it look acceptable: the access was granted, the label went onto a
+response nobody reads, and the class's window bounded nothing. A revocation arriving late was
+refused for sixty seconds and permitted from then on. What is left is a single axis: a positive
+staleness budget is permission to answer from the projection inside it, zero is no permission at
+all, and past the budget every class refuses.
 
 | Route | Class | When the projection cannot answer |
 | :-- | :-- | :-- |
@@ -59,16 +66,20 @@ most.
 | `POST /v1/administration/{id}` | `PRIVILEGED` | Never reads the projection; asks the authority |
 | `POST /v1/deletion/{id}` | `IRREVERSIBLE` | Never reads the projection; asks the authority |
 
-Four properties are held by tests rather than by prose, because widening fail-open is the
+Five properties are held by tests rather than by prose, because widening permissiveness is the
 change most likely to be made under delivery pressure and least likely to be noticed — it
 makes every symptom disappear:
 
-- only `LOW_RISK` may fail open
+- **no class serves past its bound**, and `Policy` may not carry a field that would let one
 - the two privileged classes never read the projection
-- **a broken read never fails open** — fail-open exists for a projection that is behind, not
+- **a broken read never fails open** — a budget exists for a projection that is behind, not
   for one that cannot be read; applying it to a database fault would turn a fault into an
   authorisation bypass
 - an unreachable authority refuses rather than falling back to the projection
+- **an authority-bearing event the producer has given up on refuses every projection-backed
+  class**, outside every budget — a dead-lettered revocation leaves the producer's owed pool by
+  design, so without this the answer to "is anything outstanding?" is *no* while the withdrawal
+  sits unresolved
 
 Every route declares its class at declaration, and a test fails if one does not. A class
 resolved by lookup with a default would give the wrong answer for some route — and the route

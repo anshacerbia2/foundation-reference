@@ -29,12 +29,16 @@ type Config struct {
 	// apply an effect a first replica already applied.
 	ConsumerName string
 
-	// MaxProjectionAge bounds fail-open. A LOW_RISK operation is allowed while the
+	// MaxProjectionAge is LOW_RISK's staleness budget. The operation is allowed while the
 	// projection is younger than this; past it the operation is refused rather than served
 	// from state old enough to have missed a revocation.
 	//
+	// It is the only permission that class has, now that no class serves past its bound: the
+	// budget is not a threshold at which a marker is attached, it is the whole of the window in
+	// which a projected answer may be used.
+	//
 	// There is no safe default for "unbounded", which is why this has a value rather than
-	// being optional: an unbounded fail-open is a revocation that silently never applies.
+	// being optional: a window with no end is a revocation that silently never applies.
 	MaxProjectionAge time.Duration
 
 	// AuthorityBaseURL is organization-control. PRIVILEGED and IRREVERSIBLE operations ask
@@ -116,10 +120,11 @@ func Load() (Config, error) {
 	cfg.HTTPShutdownGrace = durationOr("HTTP_SHUTDOWN_GRACE", 20*time.Second, &problems)
 	cfg.HTTPMaxInFlight = int64(intOr("HTTP_MAX_IN_FLIGHT", 256, &problems))
 
-	// A fail-open window wider than the request timeout is not a window: every request
-	// would be served from a projection nobody re-checked within the life of the request.
+	// Zero or negative is not a strict setting, it is an unconfigured one: LOW_RISK's whole
+	// permission is this window, and a non-positive value leaves the class with a budget it can
+	// never be inside. Refused at startup rather than interpreted.
 	if cfg.MaxProjectionAge <= 0 {
-		problems = append(problems, errors.New("REFERENCE_MAX_PROJECTION_AGE must be positive: an unbounded fail-open is a revocation that never applies"))
+		problems = append(problems, errors.New("REFERENCE_MAX_PROJECTION_AGE must be positive: it is LOW_RISK's whole staleness budget"))
 	}
 
 	if len(problems) > 0 {

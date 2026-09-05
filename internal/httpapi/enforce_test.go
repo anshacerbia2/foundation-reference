@@ -138,9 +138,13 @@ func TestHighConfidentialityToleratesNoStaleness(t *testing.T) {
 }
 
 // TestABrokenReadNeverFailsOpen separates "the projection is behind" from "the projection
-// cannot be read". Fail-open exists for the first. Applying it to the second would turn a
+// cannot be read". A budget exists for the first. Applying it to the second would turn a
 // database fault into an authorisation bypass, on the class where bypass is cheapest to
 // reach.
+//
+// The name survives the removal of the FailOpen flag on purpose: no class fails open any more, and
+// this case is the reason the phrase is still worth asserting -- an error path that returns a
+// permissive default is fail-open whether or not a field says so.
 func TestABrokenReadNeverFailsOpen(t *testing.T) {
 	broken := stubProjection{age: time.Second, lookupErr: errors.New("connection reset by peer")}
 
@@ -209,9 +213,9 @@ func TestAMissingAuthorityRefusesThePrivilegedClasses(t *testing.T) {
 // projection case, and it is sound where the old one was not.
 //
 // A consumer with no snapshot holds a model containing everything since it connected and nothing
-// before. It has no positive authority for anyone, so no class may serve from it -- including the
-// class that otherwise fails open, because fail-open is for an answer that may be out of date, not
-// for having no answer at all.
+// before. It has no positive authority for anyone, so no class may serve from it -- ahead of any
+// freshness question, because a budget is permission for an answer that may be out of date rather
+// than for having no answer at all.
 func TestAConsumerThatNeverBootstrappedRefusesEverything(t *testing.T) {
 	unbootstrapped := stubProjection{ageErr: projection.ErrNotBootstrapped, lookupErr: projection.ErrNotProjected}
 
@@ -265,13 +269,18 @@ func TestAnActiveMembershipIsAllowedWithinTheWindow(t *testing.T) {
 	}
 }
 
-// TestLowRiskServesAStaleActiveAnswerAndMarksIt is what fail-open means under the positive-authority
-// model, and it is narrower than what it meant before.
+// TestLowRiskIsBoundedRatherThanFailOpen is the third of the principal review's P0 corrections, and
+// it replaces a test that asserted the defect.
 //
-// Fail-open applies to a positive answer that may be out of date -- an active membership whose
-// revocation might be in flight. It does NOT apply to the absence of an answer, which is now a
-// refusal for every class. The old test asserted the opposite, and it was asserting the defect.
-func TestLowRiskServesAStaleActiveAnswerAndMarksIt(t *testing.T) {
+// The predecessor asserted that a ten-minute-old projection still served a LOW_RISK read, marked
+// stale. That is what fail-open did, and the marker is what made it look acceptable: the access was
+// granted, the label was on the response nobody reads, and the class's window turned out to bound
+// nothing. A revocation arriving late was refused for sixty seconds and permitted from then on.
+//
+// So the assertion is inverted. Inside the bound an active row is served, past it the same row is
+// refused, and both halves are here because a consumer that refuses everything is trivially safe and
+// no use to anyone.
+func TestLowRiskIsBoundedRatherThanFailOpen(t *testing.T) {
 	active := projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3}
 
 	within, err := enforcer(t, stubProjection{age: 30 * time.Second, record: active}, nil).
@@ -289,13 +298,16 @@ func TestLowRiskServesAStaleActiveAnswerAndMarksIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decide past the window: %v", err)
 	}
-	if !past.Allow {
-		t.Errorf("LOW_RISK refused a stale active membership; this class fails open: %s", past.Reason)
+	if past.Allow {
+		t.Errorf("LOW_RISK served a projection ten minutes past its one-minute bound: %s", past.Reason)
 	}
-	// The allow is the designed behaviour; the flag is what makes it visible. An allow-while-stale
-	// reporting stale = false is an outage nobody can see.
+	// The refusal must still say the model was stale rather than the principal unauthorised. They
+	// are different operational facts and only one of them is a degradation to alert on.
 	if !past.Stale {
-		t.Error("a stale active answer was served without being marked stale")
+		t.Error("the refusal does not record that the projection was stale")
+	}
+	if !contains(past.Reason, "bound") {
+		t.Errorf("the reason does not name the bound that was exceeded: %q", past.Reason)
 	}
 }
 
@@ -358,7 +370,6 @@ func TestAProducerBehindItsBudgetMakesTheConsumerStale(t *testing.T) {
 		ReadAt:                time.Now().UTC(),
 	}}
 
-	// LOW_RISK fails open, so it serves -- and must say it is stale.
 	low, err := enforcerWith(t, active, nil, behind).Decide(context.Background(),
 		httpapi.LowRisk, membership(t), membership(t))
 	if err != nil {
@@ -367,8 +378,118 @@ func TestAProducerBehindItsBudgetMakesTheConsumerStale(t *testing.T) {
 	if !low.Stale {
 		t.Error("a producer ten minutes behind did not make the answer stale")
 	}
+	// And now it refuses. Under fail-open this was an allow with a marker, which meant the producer's
+	// backlog -- the one term this side cannot derive and the whole reason the frontier exists -- was
+	// measured, reported, and then ignored on the class where lag is normal.
+	if low.Allow {
+		t.Errorf("a ten-minute producer backlog was served on LOW_RISK: %s", low.Reason)
+	}
 	if low.Reason == "" || !contains(low.Reason, "owed") {
 		t.Errorf("the reason does not name the producer's backlog: %q", low.Reason)
+	}
+}
+
+// TestAnUnresolvedSecurityDeadLetterRefusesEveryProjectionBackedClass is the second of the principal
+// review's P0 corrections.
+//
+// Every local signal here says fresh: the projection applied an event a second ago, and the producer
+// owes nothing. It owes nothing because the revocation it was trying to deliver has been dead-lettered
+// -- marked published with its error recorded, which removes it from the owed pool deliberately, so
+// that one poison event cannot report a producer as permanently behind.
+//
+// That left the dangerous state indistinguishable from the healthy one. Not a stale answer, which is
+// at least visible: a confident, fresh, wrong one, for as long as nobody reads the dead-letter table.
+func TestAnUnresolvedSecurityDeadLetterRefusesEveryProjectionBackedClass(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	// Nothing owed, and one authority-bearing delivery abandoned.
+	abandoned := stubFrontier{facts: frontier.Facts{
+		HighestCommittedMark:        120,
+		Unpublished:                 false,
+		SecurityDeadLettered:        1,
+		OldestSecurityDeadLetterAge: 3 * time.Minute,
+		SecurityDebt:                true,
+		ObservedAt:                  time.Now().UTC(),
+		ReadAt:                      time.Now().UTC(),
+	}}
+
+	for _, class := range []httpapi.Class{httpapi.LowRisk, httpapi.HighConfidentiality} {
+		decision, err := enforcerWith(t, active, nil, abandoned).Decide(context.Background(),
+			class, membership(t), membership(t))
+		if err != nil {
+			t.Fatalf("%s: Decide: %v", class, err)
+		}
+		if decision.Allow {
+			t.Errorf("%s: served an active row while the producer had given up on a delivery: %s",
+				class, decision.Reason)
+		}
+		if !decision.Stale {
+			t.Errorf("%s: the refusal does not record the model as unvouchable", class)
+		}
+	}
+}
+
+// TestADeadLetterDebtIsOutsideEveryBudget states why the debt is not aged against MaxStale.
+//
+// Three seconds of debt is well inside the sixty-second window, and it still refuses. The reason is
+// not strictness for its own sake: an unpublished row will be delivered, so ageing it against a budget
+// says something true, while a dead-lettered row has been given up on and only an operator will move
+// it. Ageing that against a budget would say a revocation nobody will ever deliver becomes acceptable
+// once it is old enough -- the inversion of what age means everywhere else here.
+func TestADeadLetterDebtIsOutsideEveryBudget(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	justAbandoned := stubFrontier{facts: frontier.Facts{
+		SecurityDeadLettered:        1,
+		OldestSecurityDeadLetterAge: 3 * time.Second,
+		SecurityDebt:                true,
+		ObservedAt:                  time.Now().UTC(),
+		ReadAt:                      time.Now().UTC(),
+	}}
+
+	decision, err := enforcerWith(t, active, nil, justAbandoned).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.Allow {
+		t.Errorf("a three-second-old abandoned delivery was aged against the window and served: %s",
+			decision.Reason)
+	}
+	if !contains(decision.Reason, "given up") {
+		t.Errorf("the reason does not distinguish an abandoned delivery from a late one: %q", decision.Reason)
+	}
+}
+
+// And the other direction, which has to be asserted or the case above is satisfied by a consumer that
+// refuses everything: a producer reporting no debt and nothing owed serves.
+func TestNoDeadLetterDebtServesWithinTheBound(t *testing.T) {
+	active := stubProjection{
+		age:    time.Second,
+		record: projection.Record{MembershipID: membership(t), Status: projection.Active, Version: 3},
+	}
+	resolved := stubFrontier{facts: frontier.Facts{
+		HighestCommittedMark: 120,
+		// An operator resolved it, so the count is zero and the flag is false. A frontier that kept
+		// refusing after resolution would have no exit at all.
+		SecurityDeadLettered: 0,
+		SecurityDebt:         false,
+		ObservedAt:           time.Now().UTC(),
+		ReadAt:               time.Now().UTC(),
+	}}
+
+	decision, err := enforcerWith(t, active, nil, resolved).Decide(context.Background(),
+		httpapi.LowRisk, membership(t), membership(t))
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !decision.Allow || decision.Stale {
+		t.Errorf("a producer owing nothing and holding no debt refused a fresh active row: allow = %v, "+
+			"stale = %v, reason = %q", decision.Allow, decision.Stale, decision.Reason)
 	}
 }
 
