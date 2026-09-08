@@ -10,7 +10,7 @@ module github.com/anshacerbia2/foundation-reference
 // the same way the two control repositories state it.
 go 1.25.0
 
-require github.com/anshacerbia2/foundation-platform v0.2.2
+require github.com/anshacerbia2/foundation-platform v0.2.3
 
 require (
 	github.com/go-logr/logr v1.4.3 // indirect
