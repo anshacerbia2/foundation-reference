@@ -99,17 +99,30 @@ func NewHTTPPublisher(endpoint, token string, timeout time.Duration, telemetry *
 // A timeout is retryable and is also the ambiguous case: the consumer may have committed and the
 // acknowledgement been lost. That is safe only because the consumer deduplicates inside the
 // transaction that applies the effect, which foundation-reference asserts.
-func (p *HTTPPublisher) Publish(ctx context.Context, envelope event.Envelope) error {
+//
+// # What a 2xx establishes, and what it does not
+//
+// A successful publication returns an outbox.Receipt, and its class comes from the consumer rather
+// than from this adapter's opinion. A consumer that applied the event within the delivery says so
+// in outbox.ApplicationReceiptHeader, and only that header produces applied evidence -- the class
+// the dead-letter resolution contract accepts as proof the consumer holds the event.
+//
+// This adapter cannot claim it on the consumer's behalf. outbox.Receipt's field is unexported, so
+// the only route to the strong class is outbox.ReceiptFromMarker with the header the consumer
+// returned. When this file is replaced by a broker client, the broker's acknowledgement carries no
+// such header, the receipts become transport evidence, and resolution stops finding proof -- which
+// is the intended outcome rather than a regression to work around.
+func (p *HTTPPublisher) Publish(ctx context.Context, envelope event.Envelope) (outbox.Receipt, error) {
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		// The envelope came out of this system's own outbox and failed to marshal, so no retry
 		// will fix it. Poison rather than an endless loop over a row nobody can send.
-		return fmt.Errorf("%w: encoding %s: %v", outbox.ErrPoison, envelope.ID, err)
+		return outbox.Receipt{}, fmt.Errorf("%w: encoding %s: %v", outbox.ErrPoison, envelope.ID, err)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("dispatch: building the delivery for %s: %w", envelope.ID, err)
+		return outbox.Receipt{}, fmt.Errorf("dispatch: building the delivery for %s: %w", envelope.ID, err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+p.token)
@@ -125,13 +138,20 @@ func (p *HTTPPublisher) Publish(ctx context.Context, envelope event.Envelope) er
 	if err != nil {
 		// Includes the timeout, and therefore includes the case where the consumer committed and
 		// the response was lost. Retryable on purpose.
-		return fmt.Errorf("dispatch: delivering %s: %w", envelope.ID, err)
+		return outbox.Receipt{}, fmt.Errorf("dispatch: delivering %s: %w", envelope.ID, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		// The header is read before the body is drained, because draining can fail and the
+		// evidence class is already decided by this point.
+		//
+		// A 2xx without the header is not an error and not applied evidence: an older consumer,
+		// or a proxy that answered on its behalf, delivered something to somebody. The receipt
+		// records what was actually established rather than what the status code suggests.
+		marker := response.Header.Get(outbox.ApplicationReceiptHeader)
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDetail))
-		return nil
+		return outbox.ReceiptFromMarker(marker), nil
 	}
 
 	detail, _ := io.ReadAll(io.LimitReader(response.Body, maxDetail))
@@ -139,10 +159,10 @@ func (p *HTTPPublisher) Publish(ctx context.Context, envelope event.Envelope) er
 
 	switch response.StatusCode {
 	case http.StatusBadRequest, http.StatusConflict, http.StatusUnprocessableEntity:
-		return fmt.Errorf("%w: the consumer refused %s with %d: %s",
+		return outbox.Receipt{}, fmt.Errorf("%w: the consumer refused %s with %d: %s",
 			outbox.ErrPoison, envelope.ID, response.StatusCode, trimmed)
 	default:
-		return fmt.Errorf("dispatch: the consumer answered %d for %s: %s",
+		return outbox.Receipt{}, fmt.Errorf("dispatch: the consumer answered %d for %s: %s",
 			response.StatusCode, envelope.ID, trimmed)
 	}
 }

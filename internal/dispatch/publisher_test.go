@@ -72,7 +72,7 @@ func TestAnAcceptedDeliveryIsPublished(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	})
 
-	if err := publisher.Publish(context.Background(), envelope(t)); err != nil {
+	if _, err := publisher.Publish(context.Background(), envelope(t)); err != nil {
 		t.Errorf("Publish: %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestTheConsumersPermanentRefusalsArePoison(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":"this consumer does not project that type"}`))
 		})
 
-		err := publisher.Publish(context.Background(), envelope(t))
+		_, err := publisher.Publish(context.Background(), envelope(t))
 		if !errors.Is(err, outbox.ErrPoison) {
 			t.Errorf("status %d produced %v, want ErrPoison", status, err)
 		}
@@ -104,7 +104,7 @@ func TestACredentialFailureIsRetryableRatherThanPoison(t *testing.T) {
 			w.WriteHeader(status)
 		})
 
-		err := publisher.Publish(context.Background(), envelope(t))
+		_, err := publisher.Publish(context.Background(), envelope(t))
 		switch {
 		case err == nil:
 			t.Errorf("status %d was reported as published", status)
@@ -120,7 +120,7 @@ func TestAConsumerOutageIsRetryable(t *testing.T) {
 			w.WriteHeader(status)
 		})
 
-		err := publisher.Publish(context.Background(), envelope(t))
+		_, err := publisher.Publish(context.Background(), envelope(t))
 		switch {
 		case err == nil:
 			t.Errorf("status %d was reported as published", status)
@@ -153,7 +153,7 @@ func TestATimeoutIsRetryable(t *testing.T) {
 		t.Fatalf("NewHTTPPublisher: %v", err)
 	}
 
-	publishErr := publisher.Publish(context.Background(), envelope(t))
+	_, publishErr := publisher.Publish(context.Background(), envelope(t))
 	switch {
 	case publishErr == nil:
 		t.Error("a timed-out delivery was reported as published")
@@ -175,7 +175,7 @@ func TestTheCorrelationIdentifierTravelsWithTheDelivery(t *testing.T) {
 	}
 	ctx := observability.WithCorrelationID(context.Background(), correlation.ID)
 
-	if err := publisher.Publish(ctx, envelope(t)); err != nil {
+	if _, err := publisher.Publish(ctx, envelope(t)); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if got := <-seen; got != correlation.ID.String() {

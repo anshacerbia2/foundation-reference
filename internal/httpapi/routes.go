@@ -13,6 +13,7 @@ import (
 	"github.com/anshacerbia2/foundation-platform/event"
 	"github.com/anshacerbia2/foundation-platform/id"
 	"github.com/anshacerbia2/foundation-platform/observability"
+	"github.com/anshacerbia2/foundation-platform/outbox"
 
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
@@ -149,6 +150,21 @@ func Routes(cfg Config) (*Surface, error) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
+
+		// The application receipt. Set only here -- after Apply has returned without error,
+		// which means the event was applied and the inbox guard committed in the same
+		// transaction -- so the header asserts something this handler actually observed.
+		//
+		// It is what lets the producer record applied evidence for this delivery, which the
+		// dead-letter resolution contract accepts as proof that this consumer holds the event.
+		// Every refusal path above returns before this line, so a refused delivery cannot
+		// produce it.
+		//
+		// A duplicate carries it too, and that is correct rather than lenient: a duplicate means
+		// the inbox guard found this event already applied, so the assertion "this consumer has
+		// applied it" is true. A replay of an abandoned delivery is exactly that case, and it is
+		// the case the resolution path depends on.
+		w.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"applied":    outcome.Applied,
