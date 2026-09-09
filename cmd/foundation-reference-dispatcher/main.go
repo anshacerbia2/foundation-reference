@@ -59,6 +59,7 @@ func run() error {
 	dsn := strings.TrimSpace(os.Getenv("DISPATCH_OUTBOX_DATABASE_URL"))
 	endpoint := strings.TrimSpace(os.Getenv("DISPATCH_CONSUMER_ENDPOINT"))
 	token := strings.TrimSpace(os.Getenv("DISPATCH_DELIVERY_TOKEN"))
+	consumer := strings.TrimSpace(os.Getenv("DISPATCH_CONSUMER_NAME"))
 
 	var problems []error
 	if dsn == "" {
@@ -66,6 +67,17 @@ func run() error {
 	}
 	if endpoint == "" {
 		problems = append(problems, errors.New("DISPATCH_CONSUMER_ENDPOINT is required"))
+	}
+	if consumer == "" {
+		// The name, not the URL. Delivery receipts are keyed by it, and the resolution contract
+		// asks whether a specific consumer holds a specific event -- a question an endpoint
+		// cannot answer, because an endpoint moves and the consumer identity does not.
+		//
+		// It must be the same name the consumer registered with organization-control, and
+		// nothing here can check that: the two are configured separately and this process holds
+		// no provider credential. A mismatch produces receipts nobody's resolution reads, which
+		// is why the name is required rather than derived from the endpoint.
+		problems = append(problems, errors.New("DISPATCH_CONSUMER_NAME is required; it must match the name registered with the producer"))
 	}
 	if token == "" {
 		// Refused here rather than discovered per delivery. Sent unauthenticated, every event
@@ -112,6 +124,7 @@ func run() error {
 	}
 
 	dispatcher, err := outbox.NewDispatcher(pool, publisher, outbox.Config{
+		Consumer:     consumer,
 		Interval:     interval,
 		IdleInterval: idle,
 	})
@@ -120,7 +133,8 @@ func run() error {
 	}
 
 	logger.Info("dispatching",
-		slog.String("consumer", endpoint),
+		slog.String("consumer", consumer),
+		slog.String("endpoint", endpoint),
 		slog.Duration("interval", interval),
 		slog.Duration("idle_interval", idle),
 		slog.Duration("publish_timeout", timeout))

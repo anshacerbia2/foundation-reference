@@ -16,7 +16,7 @@ ADDR ?= 127.0.0.1:8096
 AUTHORITY ?= 127.0.0.1:8099
 
 .DEFAULT_GOAL := help
-.PHONY: help env migrate run deliver build fmt vet tidy test test-unit test-integration gates clean
+.PHONY: help env migrate run deliver dispatch build fmt vet tidy test test-unit test-integration gates clean
 
 help:
 	@echo Targets:
@@ -24,6 +24,7 @@ help:
 	@echo   make migrate           platform schema, then projection.membership
 	@echo   make run               the consumer on $(ADDR)
 	@echo   make deliver F=e.json  post one CloudEvents envelope to the intake
+	@echo   make dispatch          drain organization-control's outbox to this consumer
 	@echo   make gates             fmt vet build tidy test
 	@echo   make test-integration  requires .env and a running PostgreSQL
 	@echo.
@@ -52,6 +53,18 @@ deliver:
 	@if "$(F)"=="" (echo Usage: make deliver F=envelope.json && exit 1)
 	@if not exist $(F) (echo Not found: $(F) && exit 1)
 	@curl.exe -s -i -X POST -H "Content-Type: application/json" --data-binary "@$(F)" "http://$(ADDR)/v1/deliveries"
+
+# The dispatcher reads organization-control's database and posts here, so it needs that
+# service's DSN and this one running. It had no target at all until now, which meant the only
+# way to run it was to type six environment variables by hand.
+#
+# DISPATCH_CONSUMER_NAME must match REFERENCE_CONSUMER_NAME and the name registered with
+# organization-control. Nothing checks that -- the two sides are configured separately -- and a
+# mismatch produces delivery receipts nobody's resolution reads.
+dispatch:
+	@if not exist .env (echo No .env yet. Run: make env && exit 1)
+	@if "$(DISPATCH_DELIVERY_TOKEN)"=="" (echo No DISPATCH_DELIVERY_TOKEN. Mint one with the dev issuer -- it needs scope foundation-reference.deliver -- and put it in .env && exit 1)
+	go run ./cmd/foundation-reference-dispatcher
 
 build:
 	go build ./...
