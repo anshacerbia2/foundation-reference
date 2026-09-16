@@ -198,49 +198,53 @@ jobs:
           echo "the guard is load-bearing: removing it fails the ordering and convergence tests"
           mv "$file.orig" "$file"
 
-      # The application receipt must be an assertion this handler observed.
+      # The application receipt asserts one thing: this consumer applied THIS event. Two
+      # mutations, because that assertion can be made false in two different directions.
       #
-      # The producer records applied evidence for a delivery when this header comes back, and
-      # the dead-letter resolution contract accepts that class as proof this consumer holds the
-      # event. So the header has to be set after Apply returned without error, and on no other
-      # path -- a receipt on a refusal would let a resolution close an incident whose event was
+      # The producer records applied evidence when this header comes back, and the dead-letter
+      # resolution contract accepts that class as proof the consumer holds the event. A header
+      # set where the assertion is false lets a resolution close an incident whose event was
       # never projected.
       #
-      # The mutation moves the header to the top of the handler, which is the plausible
-      # mistake: it looks like setting a response default.
-      - name: the application receipt is only set after applying
+      # A: set it before Apply runs. Every refusal path then carries it, which is the plausible
+      # mistake -- it reads like setting a response default. Inserted rather than moved, so the
+      # mutation is a single edit with nothing to put back in the right place.
+      #
+      # B: set it unconditionally. A SUPERSEDED outcome then carries it, and that failure is
+      # subtler: the monotonicity guard discarded the event because a higher version was already
+      # applied, so the consumer never applied this one. The resolution it enables would still
+      # reach a safe state -- the newer version is there -- but the audit record would say the
+      # event was applied when it was dropped, in the table whose purpose is explaining why a
+      # security debt stopped blocking.
+      - name: the application receipt is only set where its assertion is true
         run: |
           file=internal/httpapi/routes.go
           cp "$file" "$file.orig"
-          # awk rather than a sed one-liner: the line has to be removed from one place and
-          # inserted in another, and awk does that without any escaping of tabs. It exits 3
-          # when either the setter or the anchor is missing, which is the branch that stops
-          # this gate passing silently after a refactor.
-          awk '
-            /w\.Header\(\)\.Set\(outbox\.ApplicationReceiptHeader/ { found = 1; next }
-            /var envelope event\.Envelope/ && !moved {
-              print "\t\tw.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)"
-              moved = 1
-            }
-            { print }
-            END { if (!found || !moved) exit 3 }
-          ' "$file" > "$file.mut"
-          if [ $? -ne 0 ]; then
-            echo "::error::the receipt setter or its anchor was not found; this check is silently passing and must be updated"
-            rm -f "$file.mut"
-            mv "$file.orig" "$file"
-            exit 1
-          fi
-          mv "$file.mut" "$file"
+
+          sed -i 's|^\t\tdecoder.DisallowUnknownFields()$|\t\tdecoder.DisallowUnknownFields()\n\t\tw.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)|' "$file"
           if git diff --quiet "$file"; then
-            echo "::error::the mutation changed nothing; this check is silently passing and must be updated"
+            echo "::error::the decoder anchor was not found; this check is silently passing and must be updated"
             mv "$file.orig" "$file"
             exit 1
           fi
           if go test ./internal/httpapi -count=1 -run 'ApplicationReceipt'; then
-            echo "::error::the suite passed with the receipt set before the event was applied, so it does not test the assertion"
+            echo "::error::the suite passed with the receipt set before the event was applied, so it does not test the refusal paths"
             mv "$file.orig" "$file"
             exit 1
           fi
-          echo "the receipt is load-bearing: setting it before applying fails the refusal tests"
+          echo "A: setting the receipt before applying fails the refusal tests"
+          cp "$file.orig" "$file"
+
+          sed -i 's|if !outcome.Superseded {|if true {|' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the superseded guard was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/httpapi -count=1 -run 'ApplicationReceipt'; then
+            echo "::error::the suite passed with the receipt set on a superseded outcome, so nothing tests that distinction"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "B: setting the receipt on a superseded outcome fails the superseded test"
           mv "$file.orig" "$file"

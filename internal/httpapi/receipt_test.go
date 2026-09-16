@@ -162,3 +162,30 @@ func TestAnUndecodableDeliveryCarriesNoApplicationReceipt(t *testing.T) {
 		t.Errorf("an undecodable delivery asserted %s = %q", outbox.ApplicationReceiptHeader, got)
 	}
 }
+
+// A superseded delivery must not assert that it was applied.
+//
+// The monotonicity guard discards the event because a higher membership_version is already
+// projected, so the consumer never applied this one. Carrying the receipt would make the producer
+// record consumer_applied for an event that was dropped, the resolver close the incident as
+// REPLAYED, and the audit record state the opposite of what happened — in the table whose whole
+// purpose is explaining why a security debt stopped blocking.
+//
+// The cost is stated rather than hidden: a dead letter already overtaken by a newer version cannot
+// be resolved as REPLAYED at all, because replaying it will always be discarded. That belongs to
+// SUPERSEDED, a separate contract outside the current scope.
+func TestASupersededDeliveryCarriesNoApplicationReceipt(t *testing.T) {
+	recorder := deliver(t, func(context.Context, event.Envelope) (projection.Outcome, error) {
+		return projection.Outcome{Superseded: true}, nil
+	})
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get(outbox.ApplicationReceiptHeader); got != "" {
+		t.Errorf("a superseded delivery asserted %s = %q; the producer would record applied "+
+			"evidence for an event this consumer discarded, and a resolution would close an "+
+			"incident on the strength of it",
+			outbox.ApplicationReceiptHeader, got)
+	}
+}

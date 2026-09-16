@@ -151,20 +151,33 @@ func Routes(cfg Config) (*Surface, error) {
 			return
 		}
 
-		// The application receipt. Set only here -- after Apply has returned without error,
-		// which means the event was applied and the inbox guard committed in the same
-		// transaction -- so the header asserts something this handler actually observed.
+		// The application receipt, and it asserts one thing: this consumer applied THIS event.
 		//
-		// It is what lets the producer record applied evidence for this delivery, which the
-		// dead-letter resolution contract accepts as proof that this consumer holds the event.
-		// Every refusal path above returns before this line, so a refused delivery cannot
-		// produce it.
+		// Set only here -- after Apply has returned without error, which means the projection row
+		// and the inbox guard committed in the same transaction -- so the header reports something
+		// this handler observed. Every refusal path above returns before this line.
 		//
-		// A duplicate carries it too, and that is correct rather than lenient: a duplicate means
-		// the inbox guard found this event already applied, so the assertion "this consumer has
-		// applied it" is true. A replay of an abandoned delivery is exactly that case, and it is
-		// the case the resolution path depends on.
-		w.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)
+		// A duplicate carries it, and that is correct rather than lenient: a duplicate means the
+		// inbox guard found this event already applied, so the assertion is true. It is also the
+		// case the resolution path depends on, because replaying an abandoned delivery to a
+		// consumer that already holds the event produces exactly this.
+		//
+		// A SUPERSEDED outcome does not. The monotonicity guard discarded the event because a
+		// higher membership_version was already applied, so the consumer never applied this one
+		// and the assertion would be false. The producer would record consumer_applied for it,
+		// the resolver would close the incident as REPLAYED, and the audit record would say the
+		// event was applied when it was dropped -- a true resolution reached through a false
+		// statement, in the table whose purpose is explaining why a security debt stopped
+		// blocking.
+		//
+		// The consequence is deliberate and bounded: a dead letter already overtaken by a newer
+		// version can never be resolved as REPLAYED, because replaying it will always be
+		// discarded. Closing it belongs to SUPERSEDED, which is a separate contract and is out of
+		// the current scope. Replaying several versions of one aggregate lowest-first avoids
+		// reaching that state at all.
+		if !outcome.Superseded {
+			w.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)
+		}
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"applied":    outcome.Applied,
