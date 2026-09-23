@@ -176,6 +176,33 @@ jobs:
           echo "the debt is load-bearing: ignoring it fails the abandoned-delivery tests"
           mv "$file.orig" "$file"
 
+      # Resolving the producer's debt must restore the bystander WITHOUT releasing the revocation
+      # the incident was delaying. The A/B proof is the only case here that runs against a real
+      # projection, because the question it asks is whether an APPLIED revocation still refuses --
+      # and a stubbed Lookup answers that with its own premise.
+      #
+      # The mutation removes the withdrawal branch, so a principal every one of whose memberships
+      # was revoked no longer has an answer of its own. It is the shape of the 4pm change that
+      # clears an incident by making the refusal go away.
+      - name: a resolved debt does not release the revocation it delayed
+        run: |
+          file=internal/httpapi/enforce.go
+          cp "$file" "$file.orig"
+          sed -i -E 's/case errors\.Is\(err, projection\.ErrWithdrawn\):/case false \&\& errors.Is(err, projection.ErrWithdrawn):/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the withdrawal branch was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/httpapi -count=1 \
+              -run 'TestResolvingTheDebtRestoresTheBystanderAndLeavesTheRevocationEnforced'; then
+            echo "::error::the A/B proof passed with the withdrawal branch removed, so it does not prove the revocation is enforced"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the withdrawal branch is load-bearing: removing it fails the A/B proof"
+          mv "$file.orig" "$file"
+
       - name: the monotonicity guard is load-bearing
         run: |
           file=internal/projection/projection.go
