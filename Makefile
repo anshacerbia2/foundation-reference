@@ -16,7 +16,7 @@ ADDR ?= 127.0.0.1:8096
 AUTHORITY ?= 127.0.0.1:8099
 
 .DEFAULT_GOAL := help
-.PHONY: help env migrate run deliver dispatch build fmt vet tidy test test-unit test-integration gates clean
+.PHONY: help env migrate run deliver dispatch build fmt vet tidy test test-unit test-integration system-proof gates clean
 
 help:
 	@echo Targets:
@@ -27,6 +27,8 @@ help:
 	@echo   make dispatch          drain organization-control's outbox to this consumer
 	@echo   make gates             fmt vet build tidy test
 	@echo   make test-integration  requires .env and a running PostgreSQL
+	@echo   make system-proof      Proof A across real processes; needs organization-control
+	@echo                          checked out beside this repository at the pinned revision
 	@echo.
 	@echo   Enforcement, by hand -- the four classes differ only in what they do
 	@echo   when the projection cannot answer:
@@ -93,6 +95,17 @@ test-unit:
 test-integration:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
 	set REQUIRE_INTEGRATION=1&& go test ./internal/... -race -count=1
+
+# Proof A across the process boundary: organization-control built from the revision in
+# systemproof/organization-control.rev, this repository's consumer, dispatcher and bootstrap, and
+# a proxy that poisons exactly one delivery. See systemproof/proof_test.go.
+#
+# It refuses a producer checkout that is not the pinned commit or has local changes, and a dirty
+# tree here unless SYSTEMPROOF_ALLOW_DIRTY=1 -- a green run has to be a statement about a system
+# somebody else can rebuild. Takes about a minute; most of it is building seven binaries.
+system-proof:
+	@if not exist .env (echo No .env yet. Run: make env && exit 1)
+	go test -tags systemproof ./systemproof -run TestProofAAcrossTheProcessBoundary -count=1 -v -timeout 10m
 
 gates: fmt vet build tidy test
 	@echo All gates passed.

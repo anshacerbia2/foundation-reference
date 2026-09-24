@@ -10,6 +10,11 @@ coverage
 .env
 .fmt.tmp
 
+# The system proof's working area: CI checks organization-control out here at the pinned revision,
+# and the proof refuses to run against a dirty tree -- so an untracked checkout inside this one would
+# make every CI run refuse itself.
+.systemproof/
+
 # Editor and OS noise.
 .idea/
 .vscode/

@@ -275,3 +275,85 @@ jobs:
           fi
           echo "B: setting the receipt on a superseded outcome fails the superseded test"
           mv "$file.orig" "$file"
+
+
+  # Proof A across the process boundary -- the final P0 gate, frozen by the principal review.
+  #
+  # Every other check in this estate proves one side at a time, and all of them stay green while the
+  # seam between the two sides is broken: the frontier's wire format, the delivery contract, the
+  # consumer name each side holds about the other, and whether a state change on one side reaches a
+  # decision on the other. This job runs the real system and asserts that seam.
+  #
+  # organization-control is checked out at the commit in systemproof/organization-control.rev, not
+  # at a branch. The closure artifact has to name the exact system it closed, and a floating
+  # checkout would make a green run a statement about a system nobody can rebuild. The proof itself
+  # refuses a producer checkout that is not the pin, so a mis-wired checkout here fails rather than
+  # quietly proving something else. The revisions and the timeline land in the job summary.
+  #
+  # A separate job with its own PostgreSQL: the proof creates, drops and recreates databases and
+  # sets cluster role passwords, which must not share an engine with the verify job's suites.
+  system-proof:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SYSTEMPROOF_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      SYSTEMPROOF_ORGANIZATION_CONTROL_SRC: ${{ github.workspace }}/.systemproof/organization-control
+      SYSTEMPROOF_LOG_DIR: ${{ github.workspace }}/.systemproof/logs
+      # Throwaway values for a throwaway cluster. Locally these must be the development ones,
+      # because the roles belong to the cluster rather than to a database.
+      TEST_RUNTIME_PASSWORD: runtime
+      TEST_PROVIDER_PASSWORD: provider
+      TEST_DISPATCH_PASSWORD: dispatch
+      TEST_RESOLUTION_PASSWORD: resolution
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: read the pinned organization-control revision
+        id: pin
+        run: |
+          rev="$(tr -d '[:space:]' < systemproof/organization-control.rev)"
+          if ! printf '%s' "$rev" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::systemproof/organization-control.rev must hold one full commit SHA, found '$rev'"
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anshacerbia2/organization-control
+          ref: ${{ steps.pin.outputs.rev }}
+          path: .systemproof/organization-control
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Proof A across the process boundary
+        run: go test -tags systemproof ./systemproof -run TestProofAAcrossTheProcessBoundary -count=1 -v -timeout 10m
+
+      # The proof prints the tail of every child's log when it fails, so this is for the whole of each
+      # one: a failure whose cause is fifty lines up is otherwise a failure with no cause.
+      - name: process logs
+        if: failure()
+        run: |
+          for f in .systemproof/logs/*.log; do
+            echo "==================== $f"
+            cat "$f"
+          done
