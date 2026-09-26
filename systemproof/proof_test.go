@@ -288,6 +288,33 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 			"  under debt:     %q\n  after recovery: %q", debtA.Reason, withdrawnA.Reason)
 	}
 	timeline.mark("A's refusal reason moved: debt -> withdrawal")
+
+	// --- Phase three: the Tenant is suspended, and the consumer refuses its members. -----------
+	//
+	// The authority refuses every member of a Tenant that is not active, whatever their Membership
+	// says. The consumer used to refuse Tenant events as unknown types, so a suspension dead-lettered
+	// and B went on being served here while the authority refused B. Asserted across the process
+	// boundary, and in both directions: the restoration has to lift it, because the snapshot's old
+	// shortcut wrote a suspension onto membership rows that no Tenant event could clear.
+	// A transition carries the version the caller was shown, so the Tenant is read first.
+	current := api.expect(http.StatusOK, http.MethodGet, producerURL("/v1/tenants/"+tenantID), provider, nil)
+	suspended := api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/tenants/"+tenantID+"/suspend"),
+		provider, map[string]any{"expected_version": versionOf(t, current)})
+	suspendedAt := time.Now()
+	timeline.mark("tenant %s suspended in organization-control", tenantID)
+
+	refusedB := waitDecision(t, api, b, frontierTTL()+slack, "B to be refused for the suspended tenant",
+		refusedForTenant)
+	timeline.mark("tenant suspended: B %s (%s after the suspension)", refusedB,
+		time.Since(suspendedAt).Round(time.Millisecond))
+
+	api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/tenants/"+tenantID+"/restore"),
+		provider, map[string]any{"expected_version": versionOf(t, suspended)})
+	restoredAt := time.Now()
+	restoredB := waitDecision(t, api, b, frontierTTL()+slack, "B to be served after the tenant is restored",
+		allowed)
+	timeline.mark("tenant restored: B %s (%s after the restoration)", restoredB,
+		time.Since(restoredAt).Round(time.Millisecond))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -952,6 +979,24 @@ func refusedForDebt(d decision) bool { return !d.Allowed && isDebtReason(d.Reaso
 func isDebtReason(reason string) bool { return strings.Contains(reason, "given up on") }
 
 func isWithdrawalReason(reason string) bool { return strings.Contains(reason, "no active membership") }
+
+// versionOf reads a Tenant's version from either shape the producer answers with: the Tenant itself,
+// or a transition result carrying it under "tenant".
+func versionOf(t *testing.T, body map[string]any) int64 {
+	t.Helper()
+	if nested, ok := body["tenant"].(map[string]any); ok {
+		body = nested
+	}
+	version, ok := body["version"].(float64)
+	if !ok || version <= 0 {
+		t.Fatalf("the producer's tenant carries no version: %v", body)
+	}
+	return int64(version)
+}
+
+func refusedForTenant(d decision) bool {
+	return !d.Allowed && strings.Contains(d.Reason, "tenant is not active")
+}
 
 // waitDecision polls until the predicate holds or the bound passes, and fails with the last
 // answer. The bound is the assertion: a decision that arrives later than it is a failure, not a

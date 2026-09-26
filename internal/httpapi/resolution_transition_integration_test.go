@@ -157,11 +157,16 @@ func TestResolvingTheDebtRestoresTheBystanderAndLeavesTheRevocationEnforced(t *t
 		PrincipalID:  bystanderSeed.principal,
 		Status:       projection.Active,
 		Version:      1,
+		TenantStatus: "active",
+
+		TenantSecurityVersion: 1,
 	}}, 1000, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
 
 	a, b := newPrincipal(t), newPrincipal(t)
+	activeTenant(t, projector, ctx, a.tenant, 1004)
+	activeTenant(t, projector, ctx, b.tenant, 1005)
 	applyDelivery(t, projector, ctx, a, projection.MembershipGranted, "active", 1, 1001)
 	applyDelivery(t, projector, ctx, a, projection.MembershipRevoked, "revoked", 2, 1002)
 	applyDelivery(t, projector, ctx, b, projection.MembershipGranted, "active", 1, 1003)
@@ -260,5 +265,21 @@ func TestResolvingTheDebtRestoresTheBystanderAndLeavesTheRevocationEnforced(t *t
 	if !servedB.Allow || stillRefusedA.Allow {
 		t.Fatalf("resolution did not separate the two principals: B allowed=%v, A allowed=%v",
 			servedB.Allow, stillRefusedA.Allow)
+	}
+}
+
+// activeTenant delivers the Tenant's activation, as the producer publishes it before any Membership
+// in the Tenant can exist. Without it the consumer holds no Tenant state and refuses every member.
+func activeTenant(t *testing.T, projector *projection.Projector, ctx context.Context, tenant id.UUID, position int64) {
+	t.Helper()
+	envelope, err := event.New(producer, projection.TenantActivated, time.Now().UTC(), projection.TenantPayload{
+		TenantID: tenant, TenantStatus: "active", TenantSecurityVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("building a tenant envelope: %v", err)
+	}
+	envelope.StreamPosition = position
+	if _, err := projector.Apply(ctx, envelope); err != nil {
+		t.Fatalf("activating tenant %s: %v", tenant, err)
 	}
 }

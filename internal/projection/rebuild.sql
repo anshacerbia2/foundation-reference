@@ -15,4 +15,5 @@
 -- what it knows, rather than an empty table that reads as "nothing is revoked".
 
 DROP TABLE IF EXISTS projection.membership;
+DROP TABLE IF EXISTS projection.tenant;
 DROP TABLE IF EXISTS projection.watermark;

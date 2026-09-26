@@ -51,9 +51,9 @@ func TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot(t *testing.T) {
 	// Page 1, taken at mark 1000: the state as of then.
 	if err := projector.Seed(ctx, []projection.Seeded{
 		{MembershipID: stable.membership, TenantID: stable.tenant, PrincipalID: stable.principal,
-			Status: projection.Active, Version: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
 		{MembershipID: moved.membership, TenantID: moved.tenant, PrincipalID: moved.principal,
-			Status: projection.Active, Version: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
 	}, mark, false); err != nil {
 		t.Fatalf("seeding page 1: %v", err)
 	}
@@ -66,9 +66,9 @@ func TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot(t *testing.T) {
 	// not exist at mark 1000 and appears here anyway.
 	if err := projector.Seed(ctx, []projection.Seeded{
 		{MembershipID: replaced.membership, TenantID: replaced.tenant, PrincipalID: replaced.principal,
-			Status: projection.Active, Version: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
 		{MembershipID: replacement.membership, TenantID: replacement.tenant, PrincipalID: replacement.principal,
-			Status: projection.Active, Version: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
 	}, mark, true); err != nil {
 		t.Fatalf("seeding page 2: %v", err)
 	}
@@ -97,6 +97,8 @@ func TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot(t *testing.T) {
 
 	// The membership the snapshot never saw. This is the in-flight case: it was uncommitted when the
 	// mark was taken, so it is in neither page, and only the event delivers it.
+	// Its Tenant is new too, so the Tenant's activation arrives first, as the producer publishes it.
+	activateTenant(t, projector, ctx, late.tenant)
 	lateGrant := granted(t, late, 1)
 	lateGrant.StreamPosition = 1003
 	if _, err := projector.Apply(ctx, lateGrant); err != nil {
@@ -158,6 +160,9 @@ func TestCatchUpDoesNotRegressStateThePagesAlreadyCarried(t *testing.T) {
 		PrincipalID:  subject.principal,
 		Status:       projection.Revoked,
 		Version:      2,
+		TenantStatus: "active",
+
+		TenantSecurityVersion: 1,
 	}}, mark, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}

@@ -65,6 +65,58 @@ const (
 	Revoked   Status = "revoked"
 )
 
+// The four Tenant event types that change whether a Tenant's contexts are valid. Each carries the
+// Tenant's complete status and its tenant_security_version (TDD-organization-control-002 §Published
+// Events), so the version, not delivery order, decides which state is newer.
+//
+// Offboarding publishes tenant.security.suspended as well, carrying tenant_status "offboarding":
+// one event type for both, because the consequence is the same and the status says which.
+const (
+	TenantActivated event.Type = "com.scnehaux.organization.tenant.lifecycle.activated"
+	TenantSuspended event.Type = "com.scnehaux.organization.tenant.security.suspended"
+	TenantRestored  event.Type = "com.scnehaux.organization.tenant.security.restored"
+	TenantRetired   event.Type = "com.scnehaux.organization.tenant.lifecycle.retired"
+)
+
+var tenantTypes = map[event.Type]bool{
+	TenantActivated: true,
+	TenantSuspended: true,
+	TenantRestored:  true,
+	TenantRetired:   true,
+}
+
+// acknowledged are the producer's event types this consumer receives and does not act on.
+//
+// The dispatcher delivers every event the producer publishes, and before this list existed every one
+// of these was refused as an unknown type -- poison, dead-lettered, and never closable, because a
+// replay is refused again and none of them is a Membership event. So every Workspace change and every
+// invitation left an incident that alerted forever.
+//
+// Listed by name rather than by a rule such as "anything not security-class". A type added later is
+// still refused until someone decides here whether this consumer needs it, which is the property
+// the refusal existed for: a consumer that silently skips a type it does not recognise reports success
+// for work it never did. projection.repair.reconciled is deliberately absent. It carries corrections
+// this consumer ought to apply and cannot yet (organization-control ROADMAP item 19), and refusing it
+// keeps that gap visible rather than silent.
+var acknowledged = map[event.Type]bool{
+	"com.scnehaux.organization.workspace.lifecycle.created":     true,
+	"com.scnehaux.organization.workspace.lifecycle.archived":    true,
+	"com.scnehaux.organization.workspace.lifecycle.restored":    true,
+	"com.scnehaux.organization.workspace.lifecycle.retired":     true,
+	"com.scnehaux.organization.organization.registry.created":   true,
+	"com.scnehaux.organization.organization.registry.suspended": true,
+	"com.scnehaux.organization.organization.registry.restored":  true,
+	"com.scnehaux.organization.organization.registry.retired":   true,
+	"com.scnehaux.organization.membership.invitation.requested": true,
+	"com.scnehaux.organization.membership.invitation.accepted":  true,
+	"com.scnehaux.organization.membership.invitation.revoked":   true,
+	"com.scnehaux.organization.membership.invitation.expired":   true,
+	"com.scnehaux.organization.tenant.offboarding.started":      true,
+	"com.scnehaux.organization.tenant.offboarding.frozen":       true,
+	"com.scnehaux.organization.tenant.offboarding.released":     true,
+	"com.scnehaux.organization.tenant.lifecycle.requested":      true,
+}
+
 var (
 	ErrNoPool          = errors.New("projection: a pool is required")
 	ErrNoConsumer      = errors.New("projection: a consumer name is required")
@@ -72,6 +124,15 @@ var (
 	ErrMalformed       = errors.New("projection: payload does not carry the members this consumer needs")
 	ErrNotProjected    = errors.New("projection: no membership is projected for this tenant and principal")
 	ErrNotBootstrapped = errors.New("projection: this consumer has taken no snapshot, so it holds no positive authority")
+
+	// ErrTenantInactive means the Tenant is projected and is not active: suspended, offboarding or
+	// retired. Every member is refused, as the authority's own check refuses them.
+	ErrTenantInactive = errors.New("projection: the tenant is not active")
+
+	// ErrTenantNotProjected means an active membership exists and its Tenant's state has not
+	// arrived. Refused rather than assumed active: absence here means no positive authority, as it
+	// does for a membership.
+	ErrTenantNotProjected = errors.New("projection: no tenant state is projected for this tenant")
 )
 
 // statusFor maps an event type to the state it produces. A type absent here is refused rather than
@@ -139,7 +200,19 @@ type Outcome struct {
 	Applied    bool
 	Duplicate  bool
 	Superseded bool
-	Record     Record
+
+	// Acknowledged means the event is one this consumer receives and does not act on. Nothing was
+	// applied, so no application receipt is due.
+	Acknowledged bool
+
+	Record Record
+}
+
+// TenantPayload is the subset of a Tenant event this consumer reads.
+type TenantPayload struct {
+	TenantID              id.UUID `json:"tenant_id"`
+	TenantStatus          string  `json:"tenant_status"`
+	TenantSecurityVersion int64   `json:"tenant_security_version"`
 }
 
 // Position is what this consumer knows about its own place in the producer's stream.
@@ -211,6 +284,13 @@ ON CONFLICT (consumer) DO UPDATE
 // Apply projects one delivery. Safe to call with the same envelope any number of times, in any order
 // relative to other envelopes.
 func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome, error) {
+	switch {
+	case tenantTypes[envelope.Type]:
+		return p.applyTenant(ctx, envelope)
+	case acknowledged[envelope.Type]:
+		return p.acknowledge(ctx, envelope)
+	}
+
 	status, known := statusFor[envelope.Type]
 	if !known {
 		return Outcome{}, fmt.Errorf("%w: %s", ErrUnknownType, envelope.Type)
@@ -285,6 +365,85 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 	return outcome, nil
 }
 
+// The ordering rule for a Tenant: its security version, which the authority increments under a row
+// lock on every transition that changes whether the Tenant's contexts are valid. An event carrying a
+// version no higher than the one held is older, or a duplicate, and changes nothing.
+const upsertTenantStatement = `INSERT INTO projection.tenant
+    (tenant_id, tenant_status, tenant_security_version, applied_mark, applied_at, event_id)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (tenant_id) DO UPDATE
+   SET tenant_status           = excluded.tenant_status,
+       tenant_security_version = excluded.tenant_security_version,
+       applied_mark            = excluded.applied_mark,
+       applied_at              = excluded.applied_at,
+       event_id                = excluded.event_id
+ WHERE excluded.tenant_security_version > tenant.tenant_security_version`
+
+// applyTenant projects one Tenant event, under the same inbox guard and in the same transaction as
+// the watermark, as a Membership event is.
+func (p *Projector) applyTenant(ctx context.Context, envelope event.Envelope) (Outcome, error) {
+	if envelope.StreamPosition <= 0 {
+		return Outcome{}, fmt.Errorf("%w: the envelope carries no stream position", ErrMalformed)
+	}
+	var payload TenantPayload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		return Outcome{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	if payload.TenantID.IsNil() || payload.TenantStatus == "" || payload.TenantSecurityVersion <= 0 {
+		return Outcome{}, fmt.Errorf("%w: tenant_id, tenant_status and a positive tenant_security_version are required",
+			ErrMalformed)
+	}
+
+	var outcome Outcome
+	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		first, err := inbox.Guard(ctx, tx, p.consumer, envelope.ID, envelope.Type)
+		if err != nil {
+			return err
+		}
+		if !first {
+			outcome.Duplicate = true
+			return nil
+		}
+		appliedAt := p.now().UTC()
+		tag, err := tx.Exec(ctx, upsertTenantStatement, payload.TenantID.String(), payload.TenantStatus,
+			payload.TenantSecurityVersion, envelope.StreamPosition, appliedAt, envelope.ID.String())
+		if err != nil {
+			return fmt.Errorf("projection: applying %s: %w", envelope.ID, err)
+		}
+		if _, err := tx.Exec(ctx, advanceWatermark, p.consumer, envelope.StreamPosition, appliedAt); err != nil {
+			return fmt.Errorf("projection: advancing the watermark: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			outcome.Superseded = true
+			return nil
+		}
+		outcome.Applied = true
+		outcome.Record = Record{TenantID: payload.TenantID, TenantSecurityVersion: payload.TenantSecurityVersion,
+			AppliedMark: envelope.StreamPosition, AppliedAt: appliedAt}
+		return nil
+	})
+	if err != nil {
+		return Outcome{}, err
+	}
+	return outcome, nil
+}
+
+// acknowledge records that an event this consumer does not act on was seen: the watermark advances,
+// because the delivery happened, and nothing else changes.
+func (p *Projector) acknowledge(ctx context.Context, envelope event.Envelope) (Outcome, error) {
+	if envelope.StreamPosition <= 0 {
+		return Outcome{}, fmt.Errorf("%w: the envelope carries no stream position", ErrMalformed)
+	}
+	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := tx.Exec(ctx, advanceWatermark, p.consumer, envelope.StreamPosition, p.now().UTC())
+		return err
+	})
+	if err != nil {
+		return Outcome{}, fmt.Errorf("projection: acknowledging %s: %w", envelope.ID, err)
+	}
+	return Outcome{Acknowledged: true}, nil
+}
+
 // ErrWithdrawn means rows exist for this pair and none of them is active. Distinct from
 // ErrNotProjected on purpose: both refuse, and only one of them means the consumer has actually seen
 // this principal. An operator reading a refusal needs to know which.
@@ -306,17 +465,34 @@ const activeStatement = `SELECT membership_id, workspace_id, membership_version,
 const anyStatement = `SELECT count(*) FROM projection.membership
  WHERE tenant_id = $1 AND principal_id = $2`
 
+// One row always, NULL when the Tenant has not been projected, so absence is a value to test rather
+// than an error to recognise.
+const tenantStatement = `SELECT t.tenant_status
+  FROM (SELECT 1) one
+  LEFT JOIN projection.tenant t ON t.tenant_id = $1`
+
 // Lookup answers whether this principal holds an active membership in this tenant.
 //
-// Three outcomes, and the caller needs all three apart:
+// The Tenant is read first, as the authority's own check reads it: a member of a Tenant that is not
+// active holds nothing, whatever their Membership says. Five outcomes, and the caller needs them apart:
 //
-//	an active membership   -> the record, nil
-//	rows but none active   -> ErrWithdrawn
-//	no rows at all         -> ErrNotProjected
+//	the tenant is projected and not active     -> ErrTenantInactive
+//	an active membership, tenant active        -> the record, nil
+//	an active membership, tenant not projected -> ErrTenantNotProjected
+//	rows but none active                       -> ErrWithdrawn
+//	no rows at all                             -> ErrNotProjected
 func (p *Projector) Lookup(ctx context.Context, tenantID, principalID id.UUID) (Record, error) {
 	record := Record{TenantID: tenantID, PrincipalID: principalID, Status: Active}
 
 	err := p.pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		var tenantStatus *string
+		if err := tx.QueryRow(ctx, tenantStatement, tenantID.String()).Scan(&tenantStatus); err != nil {
+			return fmt.Errorf("projection: reading tenant %s: %w", tenantID, err)
+		}
+		if tenantStatus != nil && *tenantStatus != "active" {
+			return fmt.Errorf("%w: %s is %s", ErrTenantInactive, tenantID, *tenantStatus)
+		}
+
 		rows, err := tx.Query(ctx, activeStatement, tenantID.String(), principalID.String())
 		if err != nil {
 			return fmt.Errorf("projection: reading (%s, %s): %w", tenantID, principalID, err)
@@ -341,6 +517,9 @@ func (p *Projector) Lookup(ctx context.Context, tenantID, principalID id.UUID) (
 					return fmt.Errorf("projection: stored workspace_id is not a UUID: %w", err)
 				}
 				record.WorkspaceID = &scoped
+			}
+			if tenantStatus == nil {
+				return fmt.Errorf("%w: %s", ErrTenantNotProjected, tenantID)
 			}
 			return nil
 		}
@@ -424,6 +603,10 @@ type Seeded struct {
 	Status                Status
 	Version               int64
 	TenantSecurityVersion int64
+
+	// TenantStatus is the Tenant's status at the snapshot's mark, seeded into projection.tenant under
+	// the same ordering rule as a Tenant event. The membership keeps its own status.
+	TenantStatus string
 }
 
 func (s Seeded) workspace() any {
@@ -457,6 +640,15 @@ func (p *Projector) Seed(ctx context.Context, rows []Seeded, mark int64, final b
 				row.workspace(), string(row.Status), row.Version, mark,
 				row.TenantSecurityVersion, at, row.MembershipID.String()); err != nil {
 				return fmt.Errorf("projection: seeding %s: %w", row.MembershipID, err)
+			}
+			// Every row carries its Tenant's state, so a Tenant appears once per member; the ordering
+			// rule makes the repeats no-ops, and an event newer than the snapshot is never overwritten.
+			if row.TenantStatus == "" || row.TenantSecurityVersion <= 0 {
+				return fmt.Errorf("%w: a snapshot row for %s carries no tenant state", ErrMalformed, row.MembershipID)
+			}
+			if _, err := tx.Exec(ctx, upsertTenantStatement, row.TenantID.String(), row.TenantStatus,
+				row.TenantSecurityVersion, mark, at, nil); err != nil {
+				return fmt.Errorf("projection: seeding tenant %s: %w", row.TenantID, err)
 			}
 		}
 

@@ -236,14 +236,21 @@ func TestANewerDeliveryAdvancesTheVersion(t *testing.T) {
 func TestAnUnknownEventTypeIsRefusedRatherThanIgnored(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
-	envelope := revoked(t, newSubject(t), 1)
-	// A type this consumer does not project: Tenant lifecycle belongs to a different consumer.
-	envelope.Type = "com.scnehaux.organization.tenant.lifecycle.requested"
-
-	// Refused, not silently skipped: a consumer that swallows an unrecognised type reports
-	// success for work it never did, and the dispatcher marks the row published.
-	if _, err := projector.Apply(ctx, envelope); err == nil {
-		t.Fatal("Apply accepted an event type this consumer does not project")
+	// Refused, not silently skipped: a consumer that swallows an unrecognised type reports success
+	// for work it never did, and the dispatcher marks the row published. Three kinds of unknown:
+	// a security-class type added upstream, the repair event this consumer cannot yet apply, and a
+	// type from another producer altogether. The types this consumer knowingly does not act on are
+	// acknowledged instead; see TestAnEventThisConsumerDoesNotActOnIsAcknowledged.
+	for _, typ := range []event.Type{
+		"com.scnehaux.organization.tenant.security.quarantined",
+		"com.scnehaux.organization.projection.repair.reconciled",
+		"com.scnehaux.billing.invoice.lifecycle.issued",
+	} {
+		envelope := revoked(t, newSubject(t), 1)
+		envelope.Type = typ
+		if _, err := projector.Apply(ctx, envelope); !errors.Is(err, projection.ErrUnknownType) {
+			t.Errorf("Apply returned %v for %s, want ErrUnknownType", err, typ)
+		}
 	}
 }
 
@@ -284,6 +291,9 @@ func TestAgeRefusesUntilTheConsumerHasBootstrapped(t *testing.T) {
 		PrincipalID:  seeded.principal,
 		Status:       projection.Active,
 		Version:      1,
+		TenantStatus: "active",
+
+		TenantSecurityVersion: 1,
 	}}, 1000, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -369,6 +379,7 @@ func TestTwoMembershipsForOnePairCoexist(t *testing.T) {
 	scoped := tenantWide
 	scoped.membership = newID(t)
 	workspace := newID(t)
+	activateTenant(t, projector, ctx, tenantWide.tenant)
 
 	if _, err := projector.Apply(ctx, granted(t, tenantWide, 1)); err != nil {
 		t.Fatalf("granting the tenant-wide membership: %v", err)
