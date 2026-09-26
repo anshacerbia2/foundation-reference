@@ -301,6 +301,7 @@ type environment struct {
 	logDir         string
 	binDir         string
 	allowDirty     bool
+	unpinned       bool
 
 	runtimePassword, providerPassword, dispatchPassword, resolutionPassword string
 }
@@ -352,6 +353,7 @@ func loadEnvironment(t *testing.T) environment {
 		logDir:         logDir,
 		binDir:         t.TempDir(),
 		allowDirty:     os.Getenv("SYSTEMPROOF_ALLOW_DIRTY") == "1",
+		unpinned:       os.Getenv("SYSTEMPROOF_UNPINNED") == "1",
 
 		// The same names organization-control's own suite uses. These are cluster roles, so a local
 		// run must pass the local passwords -- writing different ones would rewrite the credentials
@@ -367,6 +369,7 @@ type revisions struct {
 	producerCommit, consumerCommit     string
 	producerPlatform, consumerPlatform string
 	consumerDirty                      bool
+	unpinned                           bool
 }
 
 // recordRevisions pins the system being proven, and refuses to prove anything else.
@@ -374,6 +377,12 @@ type revisions struct {
 // The closure artifact has to identify the exact system it closed. So the producer checkout must be
 // the commit named in organization-control.rev and must be clean: a floating or locally modified
 // producer would make a green run a statement about a system nobody can reproduce.
+//
+// SYSTEMPROOF_UNPINNED=1 lifts the pin, and only the pin, for the two runs that exist to test
+// something other than the pinned system: organization-control's own CI, which proves its pull
+// request against this consumer, and the scheduled runs against the other side's main, which find
+// drift before a pin bump does. Such a run is logged as UNPINNED and is never a closure record. The
+// producer must still be a clean commit, so an unpinned run still names the system it ran.
 func recordRevisions(t *testing.T, env environment) revisions {
 	t.Helper()
 
@@ -385,7 +394,8 @@ func recordRevisions(t *testing.T, env environment) revisions {
 
 	var out revisions
 	out.producerCommit = git(t, env.producerSource, "rev-parse", "HEAD")
-	if out.producerCommit != pin {
+	out.unpinned = env.unpinned
+	if out.producerCommit != pin && !env.unpinned {
 		t.Fatalf("organization-control at %s is %s, and this proof is pinned to %s.\n"+
 			"Check out the pinned revision, or change organization-control.rev deliberately -- "+
 			"the pin is what makes a green run reproducible.", env.producerSource, out.producerCommit, pin)
@@ -404,7 +414,12 @@ func recordRevisions(t *testing.T, env environment) revisions {
 	out.producerPlatform = platformVersion(t, filepath.Join(env.producerSource, "go.mod"))
 	out.consumerPlatform = platformVersion(t, filepath.Join(env.consumerSource, "go.mod"))
 
-	t.Logf("organization-control  %s", out.producerCommit)
+	if out.unpinned {
+		t.Logf("organization-control  %s (UNPINNED: the pin is %s; this run is not a closure record)",
+			out.producerCommit, pin)
+	} else {
+		t.Logf("organization-control  %s", out.producerCommit)
+	}
 	t.Logf("foundation-reference  %s%s", out.consumerCommit, map[bool]string{true: " (DIRTY)"}[out.consumerDirty])
 	t.Logf("foundation-platform   %s (producer), %s (consumer)", out.producerPlatform, out.consumerPlatform)
 	return out
