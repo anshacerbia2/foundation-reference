@@ -246,7 +246,8 @@ jobs:
       # applied, so the consumer never applied this one. The resolution it enables would still
       # reach a safe state -- the newer version is there -- but the audit record would say the
       # event was applied when it was dropped, in the table whose purpose is explaining why a
-      # security debt stopped blocking.
+      # security debt stopped blocking. The same guard keeps the receipt off an acknowledged outcome,
+      # an event this consumer knowingly does not act on, and B covers that test too.
       - name: the application receipt is only set where its assertion is true
         run: |
           file=internal/httpapi/routes.go
@@ -266,18 +267,18 @@ jobs:
           echo "A: setting the receipt before applying fails the refusal tests"
           cp "$file.orig" "$file"
 
-          sed -i 's|if !outcome.Superseded {|if true {|' "$file"
+          sed -i 's|if !outcome.Superseded && !outcome.Acknowledged {|if true {|' "$file"
           if git diff --quiet "$file"; then
             echo "::error::the superseded guard was not found; this check is silently passing and must be updated"
             mv "$file.orig" "$file"
             exit 1
           fi
-          if go test ./internal/httpapi -count=1 -run 'ApplicationReceipt'; then
-            echo "::error::the suite passed with the receipt set on a superseded outcome, so nothing tests that distinction"
+          if go test ./internal/httpapi -count=1 -run 'ApplicationReceipt|Acknowledged'; then
+            echo "::error::the suite passed with the receipt set on a superseded or acknowledged outcome, so nothing tests that distinction"
             mv "$file.orig" "$file"
             exit 1
           fi
-          echo "B: setting the receipt on a superseded outcome fails the superseded test"
+          echo "B: setting the receipt on a superseded or acknowledged outcome fails its test"
           mv "$file.orig" "$file"
 
 
