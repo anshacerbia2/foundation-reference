@@ -85,8 +85,9 @@ consumer's behalf.
 | any other failure | `503` | no |
 
 The superseded row is why a dead letter that a newer version has overtaken can never resolve as
-`REPLAYED`. Closing it takes the `SUPERSEDED` contract, which is not built yet (see
-`organization-control`'s TDD-005).
+`REPLAYED`. `organization-control` closes it as `SUPERSEDED` instead, on the `consumer_applied`
+receipt of the newer event (see its TDD-005). The missing marker on this row is what keeps that
+distinction honest.
 
 **Three names must agree, and nothing checks them.** `DISPATCH_CONSUMER_NAME`,
 `REFERENCE_CONSUMER_NAME`, and the consumer_id registered with `organization-control` must be the
