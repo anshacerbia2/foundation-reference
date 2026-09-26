@@ -11,8 +11,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Daily, not weekly: the scheduled run is where drift against organization-control's main
+  # surfaces (system-proof-main below), and a week of it is a week of breakage found by whoever
+  # bumps the pin next. RESPONSE-24 §3.
   schedule:
-    - cron: "17 4 * * 1"
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -350,6 +354,71 @@ jobs:
 
       # The proof prints the tail of every child's log when it fails, so this is for the whole of each
       # one: a failure whose cause is fifty lines up is otherwise a failure with no cause.
+      - name: process logs
+        if: failure()
+        run: |
+          for f in .systemproof/logs/*.log; do
+            echo "==================== $f"
+            cat "$f"
+          done
+
+  # The same proof against organization-control's main, on the schedule only.
+  #
+  # The job above is pinned, which keeps a green run reproducible and makes it a closure record.
+  # It also means a producer change never runs it: the producer's CI is green, the proof is not
+  # run, and the breakage appears when somebody next bumps the pin, months after its cause. This job
+  # answers the other question -- is the pair still compatible today -- and fails as a red scheduled
+  # build rather than as a surprise at bump time. Pin and schedule answer different questions and
+  # neither replaces the other (RESPONSE-24 §3). organization-control runs the mirror image: its PRs
+  # and its schedule prove it against this repository.
+  system-proof-main:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SYSTEMPROOF_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      SYSTEMPROOF_ORGANIZATION_CONTROL_SRC: ${{ github.workspace }}/.systemproof/organization-control
+      SYSTEMPROOF_LOG_DIR: ${{ github.workspace }}/.systemproof/logs
+      # Lifts the pin and nothing else: the producer must still be a clean commit, and the run is
+      # logged as UNPINNED so it can never be mistaken for a closure record.
+      SYSTEMPROOF_UNPINNED: "1"
+      TEST_RUNTIME_PASSWORD: runtime
+      TEST_PROVIDER_PASSWORD: provider
+      TEST_DISPATCH_PASSWORD: dispatch
+      TEST_RESOLUTION_PASSWORD: resolution
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anshacerbia2/organization-control
+          ref: main
+          path: .systemproof/organization-control
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Proof A against organization-control main
+        run: go test -tags systemproof ./systemproof -run TestProofAAcrossTheProcessBoundary -count=1 -v -timeout 10m
+
       - name: process logs
         if: failure()
         run: |

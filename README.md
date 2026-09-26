@@ -124,6 +124,21 @@ The system itself authors every refusal the proof asserts. The observer only rea
 of the same name checks out `organization-control` at the pinned revision. That run is the P0
 closure record (`RESPONSE-26`, run 36026176642).
 
+**Pinned and unpinned runs.** The pin keeps a green run reproducible. It also means a producer change
+never runs the proof here, so a break shows up only when someone bumps the pin. Three runs cover the
+gap (RESPONSE-24 §3):
+
+| Run | Producer | Consumer | When |
+| :-- | :-- | :-- | :-- |
+| `system-proof` here | the pin | this commit | every PR, push and daily schedule |
+| `system-proof-main` here | `organization-control` main | this commit | daily schedule and manual dispatch |
+| `system-proof` in `organization-control` | its PR head, or its main | this repository at its pin, or main when scheduled | every PR there, and its daily schedule |
+
+The two unpinned runs set `SYSTEMPROOF_UNPINNED=1`. That lifts the pin and nothing else: the
+producer must still be a clean commit, and the run is logged as `UNPINNED` with the pin beside it,
+so it never passes for a closure record. A red scheduled run means the pair has drifted. Fix it on
+whichever side broke the contract, then bump the pin deliberately.
+
 ## Security classes, not HTTP methods
 
 How much lag an operation may be authorised across is decided per **operation security class**,
