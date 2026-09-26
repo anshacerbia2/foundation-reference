@@ -107,6 +107,22 @@ func TestADuplicateDeliveryCarriesTheApplicationReceipt(t *testing.T) {
 	}
 }
 
+// An event this consumer receives and does not act on is accepted -- so the producer stops delivering
+// it and nothing dead-letters -- and carries no receipt, because nothing was applied.
+func TestAnAcknowledgedDeliveryIsAcceptedWithoutAReceipt(t *testing.T) {
+	recorder := deliver(t, func(context.Context, event.Envelope) (projection.Outcome, error) {
+		return projection.Outcome{Acknowledged: true}, nil
+	})
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: an event this consumer knowingly ignores must not be "+
+			"refused, or it dead-letters with no way to close it", recorder.Code)
+	}
+	if got := recorder.Header().Get(outbox.ApplicationReceiptHeader); got != "" {
+		t.Errorf("an acknowledged delivery carried the receipt (%q); nothing was applied", got)
+	}
+}
+
 // Every refusal path. None of them applied anything, so none of them may assert that they did.
 func TestARefusedDeliveryCarriesNoApplicationReceipt(t *testing.T) {
 	cases := map[string]struct {

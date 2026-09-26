@@ -51,8 +51,9 @@ CREATE TABLE IF NOT EXISTS projection.membership (
     -- and no longer load-bearing for ordering.
     applied_mark bigint NOT NULL CHECK (applied_mark > 0),
 
-    -- Carried so a caller can compare a token it holds against this answer. Not enforced yet, and
-    -- named here rather than added silently later.
+    -- The Tenant security version the membership event carried. Reported with an answer so a caller
+    -- can compare a token it holds against it. The Tenant's own state, which is what enforcement
+    -- reads, is projection.tenant below.
     tenant_security_version bigint NOT NULL DEFAULT 0,
 
     -- When this consumer applied it, not when the authority decided it. Keeping both would invite
@@ -79,6 +80,33 @@ CREATE INDEX IF NOT EXISTS membership_context_idx
 -- Freshness and lag are read on every projection-backed enforcement check.
 CREATE INDEX IF NOT EXISTS membership_applied_mark_idx
     ON projection.membership (applied_mark DESC);
+
+-- The Tenant's state, one row per Tenant.
+--
+-- The authority's own check refuses every member of a Tenant that is not active, whatever their
+-- Membership says, and this replica must answer the same way. A Tenant suspension is one event about
+-- the Tenant rather than one per Membership, so it cannot live on the membership rows: seeding a
+-- membership as suspended because its Tenant was suspended meant the Tenant's restoration, which
+-- changes no Membership, never lifted it.
+--
+-- Ordered by tenant_security_version, which increments on every published Tenant transition that
+-- changes whether its contexts are valid, in either direction. An older event is discarded.
+CREATE TABLE IF NOT EXISTS projection.tenant (
+    tenant_id uuid PRIMARY KEY,
+
+    -- The authority's Tenant status, verbatim. Only 'active' confers authority; the rest are kept
+    -- as-is so a refusal can name the state.
+    tenant_status text NOT NULL,
+
+    tenant_security_version bigint NOT NULL CHECK (tenant_security_version > 0),
+
+    -- The stream position of the event, or the snapshot mark when seeded. Kept for lag and triage.
+    applied_mark bigint NOT NULL CHECK (applied_mark > 0),
+    applied_at   timestamptz NOT NULL,
+
+    -- The delivery that produced this state; NULL when it came from a snapshot.
+    event_id uuid
+);
 
 -- The consumer's own position, one row.
 --

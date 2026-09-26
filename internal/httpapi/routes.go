@@ -172,10 +172,11 @@ func Routes(cfg Config) (*Surface, error) {
 		//
 		// The consequence is deliberate and bounded: a dead letter already overtaken by a newer
 		// version can never be resolved as REPLAYED, because replaying it will always be
-		// discarded. Closing it belongs to SUPERSEDED, which is a separate contract and is out of
-		// the current scope. Replaying several versions of one aggregate lowest-first avoids
-		// reaching that state at all.
-		if !outcome.Superseded {
+		// discarded. The producer closes it as SUPERSEDED instead, on the newer event's receipt.
+		//
+		// An acknowledged event -- one this consumer receives and does not act on -- carries no
+		// receipt either: nothing was applied, and the assertion would be false.
+		if !outcome.Superseded && !outcome.Acknowledged {
 			w.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)
 		}
 

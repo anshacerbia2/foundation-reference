@@ -133,22 +133,19 @@ func run(logger *slog.Logger) error {
 
 		rows := make([]projection.Seeded, 0, len(page.Rows))
 		for _, row := range page.Rows {
-			// A snapshot carries only active memberships, and the Tenant's own status travels with
-			// each row for a reason: an active membership inside a suspended Tenant grants nothing.
-			// Seeded as suspended rather than dropped, so the consumer holds the row and can be
-			// corrected by a later event instead of treating the principal as never seen.
-			status := projection.Status(row.MembershipStatus)
-			if row.TenantStatus != "active" {
-				status = projection.Suspended
-			}
+			// The Tenant's status travels with each row and is seeded as the Tenant's state, apart from
+			// the membership's. It used to be folded into the membership as "suspended", which the
+			// Tenant's later restoration -- an event about the Tenant, changing no Membership -- could
+			// never lift.
 			rows = append(rows, projection.Seeded{
 				MembershipID:          row.MembershipID,
 				TenantID:              row.TenantID,
 				PrincipalID:           row.PrincipalID,
 				WorkspaceID:           row.WorkspaceID,
-				Status:                status,
+				Status:                projection.Status(row.MembershipStatus),
 				Version:               row.MembershipVersion,
 				TenantSecurityVersion: row.TenantSecurityVersion,
+				TenantStatus:          row.TenantStatus,
 			})
 		}
 

@@ -81,8 +81,36 @@ consumer's behalf.
 | applied | `202` | yes |
 | duplicate (already applied) | `202` | yes, because the assertion is true |
 | superseded (discarded by the version guard) | `202` | **no**, because nothing was applied |
+| acknowledged (a type this consumer knowingly does not act on) | `202` | **no**, because nothing was applied |
 | not an envelope, unknown type, malformed | `400` | no |
 | any other failure | `503` | no |
+
+**What this consumer applies, and what it acknowledges.** It applies the four Membership types and
+four Tenant types:
+
+- `tenant.lifecycle.activated`
+- `tenant.security.suspended` (which offboarding also publishes, carrying `tenant_status`
+  `offboarding`)
+- `tenant.security.restored`
+- `tenant.lifecycle.retired`
+
+It acknowledges a named list of the producer's other types: Workspace, Organization registry,
+invitation, offboarding progress, and the Tenant intake request. The list is in
+`internal/projection/projection.go`. Every other type is refused as unknown, including a
+security-class type added upstream and `projection.repair.reconciled`, whose corrections this
+consumer cannot yet apply. Refusing them keeps a gap visible rather than silent.
+
+Before the list existed, every type other than Membership was refused. The dispatcher delivers
+everything the producer publishes, so every Workspace change, invitation and Tenant suspension
+dead-lettered, and none of those incidents could ever be closed.
+
+**Tenant state is enforced.** The authority refuses every member of a Tenant that is not active,
+and so does this consumer. `projection.tenant` holds each Tenant's status and is ordered by
+`tenant_security_version`. A member of a Tenant that is suspended, offboarding or retired is
+refused, whatever their Membership says. So is an active member whose Tenant state has not arrived
+yet: absence is no positive authority, for a Tenant as for a Membership. The snapshot seeds each
+Tenant's state beside its members. It used to write a suspension onto the membership rows instead,
+where the Tenant's restoration, an event about the Tenant, could never lift it.
 
 The superseded row is why a dead letter that a newer version has overtaken can never resolve as
 `REPLAYED`. `organization-control` closes it as `SUPERSEDED` instead, on the `consumer_applied`
@@ -119,6 +147,9 @@ across real processes:
    through the producer's API.
 5. B is served again, and A's refusal reason changes from debt to withdrawal. That change is the
    evidence that the revocation actually landed.
+6. It suspends the Tenant through the producer's API. B is refused with the Tenant's reason within
+   the same bound. Then it restores the Tenant, and B is served again. Both directions are asserted,
+   because the restoration is what the snapshot's old shortcut could never deliver.
 
 The system itself authors every refusal the proof asserts. The observer only reads them. The CI job
 of the same name checks out `organization-control` at the pinned revision. That run is the P0

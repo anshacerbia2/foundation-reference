@@ -185,6 +185,28 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 			Age:    age,
 		}, nil
 
+	case errors.Is(err, projection.ErrTenantInactive):
+		// The Tenant is suspended, offboarding or retired. Refused regardless of class and freshness,
+		// for the same reason as a withdrawn membership: a withdrawal that has arrived is not made less
+		// true by being old, and the authority's own check refuses every member of such a Tenant.
+		return Decision{
+			Allow:  false,
+			Reason: "the tenant is not active: " + err.Error(),
+			Stale:  stale,
+			Age:    age,
+		}, nil
+
+	case errors.Is(err, projection.ErrTenantNotProjected):
+		// An active membership, and its Tenant's state has not arrived. Refused: absence means no
+		// positive authority here as it does for a membership. The state arrives with the Tenant's
+		// activation event or the next snapshot.
+		return Decision{
+			Allow:  false,
+			Reason: "no tenant state is projected for this tenant",
+			Stale:  stale,
+			Age:    age,
+		}, nil
+
 	case errors.Is(err, projection.ErrNotProjected):
 		// No positive authority is projected for this pair, so there is nothing to permit. Refused
 		// for every class, and freshness does not enter into it: fail-open exists for an answer that
