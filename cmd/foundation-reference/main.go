@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/anshacerbia2/foundation-platform/db"
 	fhttp "github.com/anshacerbia2/foundation-platform/httpapi"
@@ -27,6 +28,7 @@ import (
 	"github.com/anshacerbia2/foundation-reference/internal/frontier"
 	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
+	enforcement "github.com/anshacerbia2/foundation-reference/internal/telemetry"
 )
 
 func main() {
@@ -46,11 +48,30 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("configuration: %w", err)
 	}
 
-	telemetry, err := observability.New(observability.Config{
-		Deployable: config.Deployable,
-		System:     config.System,
-		Logger:     logger,
-	})
+	// The Collector, when one is configured; without it nothing leaves the process, said once here.
+	var exported *observability.Exported
+	if cfg.OTLPEndpoint != "" {
+		exported, err = observability.Export(ctx, observability.ExportConfig{
+			Endpoint: cfg.OTLPEndpoint, Deployable: config.Deployable, System: config.System,
+		})
+		if err != nil {
+			return fmt.Errorf("telemetry export: %w", err)
+		}
+		defer func() {
+			flush, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := exported.Shutdown(flush); err != nil {
+				logger.Warn("telemetry flush on shutdown", slog.String("error", err.Error()))
+			}
+		}()
+	} else {
+		logger.Warn("OTEL_EXPORTER_OTLP_ENDPOINT is unset: no metric or trace leaves this process")
+	}
+	telemetryConfig := observability.Config{Deployable: config.Deployable, System: config.System, Logger: logger}
+	if exported != nil {
+		telemetryConfig.MeterProvider, telemetryConfig.TracerProvider = exported.MeterProvider, exported.TracerProvider
+	}
+	telemetry, err := observability.New(telemetryConfig)
 	if err != nil {
 		return fmt.Errorf("telemetry: %w", err)
 	}
@@ -142,10 +163,21 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("caller authentication: %w", err)
 	}
 
+	// Refusal counts, intake outcomes and the projection's age (ROADMAP item 14 in organization-control).
+	var metrics httpapi.Metrics
+	if exported != nil {
+		counted, err := enforcement.New(exported.MeterProvider, projector, cfg.MaxProjectionAge, config.Deployable, config.System)
+		if err != nil {
+			return fmt.Errorf("enforcement metrics: %w", err)
+		}
+		metrics = counted
+	}
+
 	surface, err := httpapi.Routes(httpapi.Config{
 		Projector: projector,
 		Enforcer:  enforcer,
 		Telemetry: telemetry,
+		Metrics:   metrics,
 		Delivery:  delivery,
 		Caller:    caller,
 	})

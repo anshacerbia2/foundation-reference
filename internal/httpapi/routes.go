@@ -57,10 +57,37 @@ type Deliveries interface {
 	Age(ctx context.Context) (time.Duration, error)
 }
 
+// Metrics records what the intake and the enforcer decided. Declared here so this package names
+// no metrics SDK; the composition root supplies the OpenTelemetry implementation.
+type Metrics interface {
+	// Decision counts one enforcement answer by class, allowed, and Decision.Code.
+	Decision(ctx context.Context, class Class, decision Decision)
+	// Delivery counts one intake outcome, one of the Delivery* constants.
+	Delivery(ctx context.Context, outcome string)
+}
+
+// Delivery outcomes.
+const (
+	DeliveryApplied      = "applied"
+	DeliveryDuplicate    = "duplicate"
+	DeliverySuperseded   = "superseded"
+	DeliveryAcknowledged = "acknowledged"
+	DeliveryRefused      = "refused" // unknown type or malformed: poison to the dispatcher
+	DeliveryFailed       = "failed"  // anything else: retried
+)
+
+type noMetrics struct{}
+
+func (noMetrics) Decision(context.Context, Class, Decision) {}
+func (noMetrics) Delivery(context.Context, string)          {}
+
 type Config struct {
 	Projector Deliveries
 	Enforcer  *Enforcer
 	Telemetry *observability.Telemetry
+
+	// Metrics is optional. Without it nothing is counted, and nothing else changes.
+	Metrics Metrics
 
 	// Delivery and Caller are the two authentication middlewares, kept separate because the
 	// two authorities are different: a workload that may apply events, and a principal that
@@ -97,6 +124,10 @@ func Routes(cfg Config) (*Surface, error) {
 	}
 	if cfg.Caller == nil {
 		return nil, errors.New("httpapi: caller authentication is required")
+	}
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = noMetrics{}
 	}
 
 	probes := http.NewServeMux()
@@ -138,15 +169,18 @@ func Routes(cfg Config) (*Surface, error) {
 		outcome, err := cfg.Projector.Apply(r.Context(), envelope)
 		switch {
 		case errors.Is(err, projection.ErrUnknownType):
+			metrics.Delivery(r.Context(), DeliveryRefused)
 			// Poison rather than a retryable failure: redelivering an event this consumer
 			// does not apply will fail identically forever. 400 tells the dispatcher that.
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		case errors.Is(err, projection.ErrMalformed):
+			metrics.Delivery(r.Context(), DeliveryRefused)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		case err != nil:
 			// Anything else is worth retrying, and 503 is what says so.
+			metrics.Delivery(r.Context(), DeliveryFailed)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
@@ -179,6 +213,7 @@ func Routes(cfg Config) (*Surface, error) {
 		if !outcome.Superseded && !outcome.Acknowledged {
 			w.Header().Set(outbox.ApplicationReceiptHeader, outbox.ApplicationReceiptApplied)
 		}
+		metrics.Delivery(r.Context(), deliveryOutcome(outcome))
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"applied":    outcome.Applied,
@@ -194,13 +229,13 @@ func Routes(cfg Config) (*Surface, error) {
 		}
 		// The role is chosen here, beside the security class, so both properties of a route
 		// are stated in one place and neither can be inherited from a default.
-		api.Handle(operation.Method+" "+operation.Pattern, cfg.Caller(protected(cfg.Enforcer, operation)))
+		api.Handle(operation.Method+" "+operation.Pattern, cfg.Caller(protected(cfg.Enforcer, metrics, operation)))
 	}
 
 	return &Surface{Probes: probes, API: api}, nil
 }
 
-func protected(enforcer *Enforcer, operation Operation) http.HandlerFunc {
+func protected(enforcer *Enforcer, metrics Metrics, operation Operation) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID, err := id.Parse(r.PathValue("tenant_id"))
 		if err != nil {
@@ -226,6 +261,7 @@ func protected(enforcer *Enforcer, operation Operation) http.HandlerFunc {
 		}
 
 		decision, err := enforcer.Decide(r.Context(), operation.Class, tenantID, principalID)
+		metrics.Decision(r.Context(), operation.Class, decision)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"operation": operation.Pattern,
@@ -269,4 +305,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// deliveryOutcome names an accepted delivery for the metric.
+func deliveryOutcome(outcome projection.Outcome) string {
+	switch {
+	case outcome.Acknowledged:
+		return DeliveryAcknowledged
+	case outcome.Superseded:
+		return DeliverySuperseded
+	case outcome.Duplicate:
+		return DeliveryDuplicate
+	}
+	return DeliveryApplied
 }

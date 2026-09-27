@@ -72,6 +72,10 @@ type Config struct {
 	HTTPMaxInFlight    int64
 
 	LogLevel string
+
+	// OTLPEndpoint is the OpenTelemetry Collector's OTLP/HTTP base URL. Unset, nothing is exported and
+	// startup says so.
+	OTLPEndpoint string
 }
 
 func Load() (Config, error) {
@@ -91,6 +95,7 @@ func Load() (Config, error) {
 		problems = append(problems, errors.New("REFERENCE_AUTHORITY_TOKEN is required when an authority is configured: an unauthenticated fresh check would be refused per request rather than at startup"))
 	}
 	cfg.LogLevel = stringOr("LOG_LEVEL", "info")
+	cfg.OTLPEndpoint = strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
 	cfg.TokenIssuer = strings.TrimSpace(os.Getenv("REFERENCE_TOKEN_ISSUER"))
 	if cfg.TokenIssuer == "" {
