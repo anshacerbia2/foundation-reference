@@ -188,8 +188,25 @@ across real processes:
    served, because nothing was applied. Once the hold is lifted the revocation lands on the retry,
    with exactly one receipt and no dead letter.
 
-Phases 7 and 8 were observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), and run
-on every build from here.
+9. **Revocation propagation, as a distribution.** Forty principals are granted and then revoked
+   one after another. Each revocation's latency is taken from its outbox commit to the consumer's
+   inbox record of it. Both are `now()` on the same PostgreSQL server, so the difference is on one
+   clock. The same is done for twenty more with the first delivery of each refused `503`: the
+   failing path, one retry each. The run reports p50, p95, p99 and the maximum for both paths, and
+   fails if either maximum exceeds the 6 s that TDD-organization-control-002 §Enforcement Budget
+   gives commit-to-claim plus dispatch-to-applied. Accept to commit happens inside one request and
+   is not part of this number.
+
+Phases 7 and 8 were observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), and phase
+9 replaces Proof A's single 32 ms sample. All three run on every build from here.
+
+A local run on 2026-09-28 measured:
+
+- smooth path: p50 41 ms, p95 89 ms, p99 145 ms, max 145 ms;
+- failing path: p50 287 ms, p95 375 ms, p99 398 ms, max 398 ms.
+
+That is localhost. The CI run's numbers are in its job summary. With 40 samples, the nearest-rank
+p99 is the maximum.
 
 The system itself authors every refusal the proof asserts. The observer only reads them. The CI job
 of the same name checks out `organization-control` at the pinned revision. The P0 closure record
