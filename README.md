@@ -117,6 +117,23 @@ The superseded row is why a dead letter that a newer version has overtaken can n
 receipt of the newer event (see its TDD-005). The missing marker on this row is what keeps that
 distinction honest.
 
+**The dispatcher is built here, so this repository's `go.mod` decides its foundation-platform
+version.** `organization-control` applies the platform schema, and this dispatcher drains it. Until
+`v0.2.10` it ran `v0.2.6`, so two dispatcher changes built for `organization-control` never reached
+the running system: naming the refusing consumer on a dead letter (`v0.2.8`) and the outbox lease
+(`v0.2.10`).
+
+The lease works like this:
+
+- A short transaction claims a batch.
+- Publication happens outside any transaction.
+- Each outcome commits on its own.
+- A crashed dispatcher's rows wait up to 30 s before another worker takes them.
+
+The schema must arrive first: the dispatcher refuses to start against an outbox without the lease
+columns. Bump `organization-control` before this repository whenever foundation-platform adds a
+migration.
+
 **Three names must agree, and nothing checks them.** `DISPATCH_CONSUMER_NAME`,
 `REFERENCE_CONSUMER_NAME`, and the consumer_id registered with `organization-control` must be the
 same string. Receipts are keyed by the first, and resolution looks them up by the third. A mismatch
@@ -140,7 +157,8 @@ across real processes:
 1. It starts `organization-control` at the revision pinned in `systemproof/organization-control.rev`,
    its dev issuer, this consumer, and the dispatcher, each with a hermetic environment.
 2. A proxy in front of the consumer answers `422` while A's revocation is delivered, so the
-   revocation itself is dead-lettered as poison in the priority lane.
+   revocation itself is dead-lettered as poison in the priority lane, naming this consumer as the
+   one that refused it.
 3. The proof asserts that the frontier reports security debt, and that the consumer refuses A and B
    within the frontier cache TTL (`REFERENCE_MAX_PROJECTION_AGE / 4`) plus slack.
 4. It replays the revocation, waits for a `consumer_applied` receipt, and resolves it as `REPLAYED`
@@ -152,8 +170,9 @@ across real processes:
    because the restoration is what the snapshot's old shortcut could never deliver.
 
 The system itself authors every refusal the proof asserts. The observer only reads them. The CI job
-of the same name checks out `organization-control` at the pinned revision. That run is the P0
-closure record (`RESPONSE-26`, run 36026176642).
+of the same name checks out `organization-control` at the pinned revision. The P0 closure record
+is run 36026176642 (`RESPONSE-26`), at `organization-control` `7aa69d7`. The pin has moved since,
+deliberately, each time the pair changed together.
 
 **Pinned and unpinned runs.** The pin keeps a green run reproducible. It also means a producer change
 never runs the proof here, so a break shows up only when someone bumps the pin. Three runs cover the

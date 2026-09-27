@@ -200,8 +200,8 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 
 	letter := waitDeadLetter(t, producerDB, a.membership)
 	proxy.poison.Store(false) // nothing else needs to be refused; the incident now exists
-	timeline.mark("dead letter %s: failure_class=%s priority=%d (proxy rejected %d delivery(s))",
-		letter.eventID, letter.failureClass, letter.priority, proxy.rejected.Load())
+	timeline.mark("dead letter %s: failure_class=%s priority=%d consumer=%q (proxy rejected %d delivery(s))",
+		letter.eventID, letter.failureClass, letter.priority, letter.consumer, proxy.rejected.Load())
 
 	// The two properties C1 turned on. If either fails, this is not the state the gate describes.
 	if letter.failureClass != "poison" {
@@ -212,6 +212,14 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 		t.Fatalf("the dead-lettered revocation sits in lane %d, want the priority lane %d: a standard-"+
 			"lane row dead-letters on unavailability, and the proof would be demonstrating that instead",
 			letter.priority, outbox.PriorityHigh)
+	}
+	// The dispatcher names the consumer that refused the event (foundation-platform v0.2.8), which
+	// is what lets organization-control attribute the debt to this consumer rather than to everyone
+	// and lets a retired consumer's incident be waived. Until this dispatcher moved past v0.2.6 it
+	// wrote nothing here, and only module tests had ever seen the column filled.
+	if letter.consumer != consumerName {
+		t.Fatalf("the dead letter names consumer %q, want %q: the running dispatcher does not attribute "+
+			"the incident, so every consumer carries it as debt", letter.consumer, consumerName)
 	}
 
 	waitFrontier(t, api, provider, "the producer to report the security debt", func(f frontierFacts) bool {
@@ -1071,6 +1079,7 @@ type deadLetter struct {
 	eventID      string
 	failureClass string
 	priority     int16
+	consumer     string
 }
 
 // Aggregates rather than a row that may be absent: they always return one row, so "not yet" is a
@@ -1089,12 +1098,13 @@ func waitDeadLetter(t *testing.T, pool *fdb.Pool, membershipID string) deadLette
 				SELECT count(*),
 				       coalesce(max(event_id::text), ''),
 				       coalesce(max(failure_class), ''),
-				       coalesce(max(priority), -1)
+				       coalesce(max(priority), -1),
+				       coalesce(max(consumer), '')
 				  FROM platform.dead_letter
 				 WHERE resolved_at IS NULL
 				   AND event_type = $1
 				   AND payload->>'membership_id' = $2`, revokedType, membershipID,
-			).Scan(&count, &letter.eventID, &letter.failureClass, &letter.priority)
+			).Scan(&count, &letter.eventID, &letter.failureClass, &letter.priority, &letter.consumer)
 		})
 		if err != nil {
 			t.Fatalf("reading platform.dead_letter: %v", err)
