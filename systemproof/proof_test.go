@@ -338,7 +338,7 @@ type environment struct {
 	allowDirty     bool
 	unpinned       bool
 
-	runtimePassword, providerPassword, dispatchPassword, resolutionPassword string
+	runtimePassword, providerPassword, dispatchPassword, resolutionPassword, consumerPassword string
 }
 
 func loadEnvironment(t *testing.T) environment {
@@ -397,6 +397,7 @@ func loadEnvironment(t *testing.T) environment {
 		providerPassword:   required("TEST_PROVIDER_PASSWORD", "organization_provider_app's password"),
 		dispatchPassword:   required("TEST_DISPATCH_PASSWORD", "organization_dispatch_app's password"),
 		resolutionPassword: required("TEST_RESOLUTION_PASSWORD", "organization_resolution_app's password"),
+		consumerPassword:   required("TEST_CONSUMER_PASSWORD", "organization_consumer_app's password"),
 	}
 }
 
@@ -581,6 +582,9 @@ func buildProducerDatabase(t *testing.T, env environment, b binaries) {
 		"-v", "provider_password="+env.providerPassword,
 		"-v", "dispatch_password="+env.dispatchPassword,
 		"-v", "resolution_password="+env.resolutionPassword,
+		// Ignored by a producer revision whose fixture has no consumer login role, so the harness can
+		// supply it before the producer requires it.
+		"-v", "consumer_password="+env.consumerPassword,
 		"-f", filepath.Join(env.producerSource, "scripts", "ci-fixture.sql"))
 }
 
@@ -643,14 +647,17 @@ func (env environment) producerConfig() map[string]string {
 		"ORGANIZATION_TENANT_DATABASE_URL":     env.producerDSN("organization_app", env.runtimePassword),
 		"ORGANIZATION_PROVIDER_DATABASE_URL":   env.producerDSN("organization_provider_app", env.providerPassword),
 		"ORGANIZATION_RESOLUTION_DATABASE_URL": env.producerDSN("organization_resolution_app", env.resolutionPassword),
-		"ORGANIZATION_TOKEN_ISSUER":            issuerURL,
-		"ORGANIZATION_JWKS_URL":                issuerURL + "/certs",
-		"ORGANIZATION_TOKEN_AUDIENCE":          "organization-control",
-		"ORGANIZATION_TENANT_CLAIM":            "https://scnehaux.com/tenant",
-		"ORGANIZATION_PROVIDER_ROLE":           "provider-admin",
-		"ORGANIZATION_CONSUMER_ROLE":           "projection-consumer",
-		"ORGANIZATION_CONSUMER_CLAIM":          "https://scnehaux.com/consumer_id",
-		"ORGANIZATION_LISTEN_ADDRESS":          producerAddress,
+		// The consumer's own credential. A producer revision without organization_consumer_rt ignores
+		// it; one with it requires it, since this proof configures consumer authority.
+		"ORGANIZATION_CONSUMER_DATABASE_URL": env.producerDSN("organization_consumer_app", env.consumerPassword),
+		"ORGANIZATION_TOKEN_ISSUER":          issuerURL,
+		"ORGANIZATION_JWKS_URL":              issuerURL + "/certs",
+		"ORGANIZATION_TOKEN_AUDIENCE":        "organization-control",
+		"ORGANIZATION_TENANT_CLAIM":          "https://scnehaux.com/tenant",
+		"ORGANIZATION_PROVIDER_ROLE":         "provider-admin",
+		"ORGANIZATION_CONSUMER_ROLE":         "projection-consumer",
+		"ORGANIZATION_CONSUMER_CLAIM":        "https://scnehaux.com/consumer_id",
+		"ORGANIZATION_LISTEN_ADDRESS":        producerAddress,
 	}
 }
 
