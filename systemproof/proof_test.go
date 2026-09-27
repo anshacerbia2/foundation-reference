@@ -17,6 +17,12 @@ package systemproof
 //	dispatcher            records consumer_applied         (real receipt)
 //	operator              resolves as REPLAYED             (real resolver, real resolution role)
 //	consumer              serves B, refuses A as withdrawn (after the frontier cache expires)
+//	organization-control  suspends and restores the Tenant (the consumer refuses, then serves B)
+//	proxy                 answers 503: the consumer is down (a revocation and a backlog queue)
+//	dispatcher            retries and releases, never dead-letters (an outage is not poison)
+//	consumer              receives the whole backlog on recovery (bounded by BackoffMax)
+//	proxy                 holds one delivery past the publish timeout (never forwarded)
+//	dispatcher            retries it, and it is applied exactly once (one receipt)
 //
 // # Why a proxy, and why it answers 422
 //
@@ -113,6 +119,17 @@ const (
 	// Slack above a bound, for the dispatcher's claim interval and a round trip. Small and named,
 	// because a generous slack is how a bounded-propagation assertion quietly becomes "eventually".
 	slack = 5 * time.Second
+
+	// The dispatcher's publish timeout, short so the timeout phase takes seconds rather than the
+	// default's minutes of retries.
+	publishTimeout = time.Second
+
+	// foundation-platform's BackoffMax: the longest a released priority row waits before its next
+	// attempt, so the longest a recovered consumer waits for the backlog to resume.
+	backoffMax = 30 * time.Second
+
+	// The backlog built while the consumer is down, beside the revocation.
+	backlogSize = 5
 )
 
 // frontierTTL is the consumer's frontier cache interval, computed the way cmd/foundation-reference
@@ -323,6 +340,161 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 		allowed)
 	timeline.mark("tenant restored: B %s (%s after the restoration)", restoredB,
 		time.Since(restoredAt).Round(time.Millisecond))
+
+	// --- Phase four: the consumer is down, a backlog builds, and it drains on recovery. ---------
+	//
+	// Observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), repeatable from here. B's
+	// revocation is a priority event, so the dispatcher must retry it past its local attempts and
+	// release it rather than dead-letter it: an outage is not poison. Five grants queue behind it.
+	proxy.down.Store(true)
+	api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+b.membership+"/revoke"), tenant, nil)
+	backlog := make([]principal, 0, backlogSize)
+	for i := 0; i < backlogSize; i++ {
+		backlog = append(backlog, grant(api, tenant))
+	}
+	timeline.mark("consumer down: B revoked and %d principals granted, behind a proxy answering 503", backlogSize)
+
+	outage := waitOutboxRow(t, producerDB, b.membership, 30*time.Second,
+		"B's revocation to be retried past its local attempts",
+		func(r outboxRow) bool { return r.attempts > 3 })
+	switch {
+	case outage.published:
+		t.Fatalf("B's revocation is marked published while every delivery was refused: %+v", outage)
+	case outage.failureClass != "unavailable":
+		t.Fatalf("B's revocation failed as %q, want unavailable: a consumer outage is not poison", outage.failureClass)
+	case deadLetterCount(t, producerDB, b.membership) != 0:
+		t.Fatal("B's revocation was dead-lettered during an outage; a priority event must be released instead")
+	}
+	stillB := decide(t, api, b)
+	if isWithdrawalReason(stillB.Reason) {
+		t.Fatalf("B is refused as withdrawn while its revocation has not been delivered: %s", stillB)
+	}
+	timeline.mark("during the outage: B's revocation retried %d times, failure_class=%s, not dead-lettered "+
+		"(proxy answered 503 %d times); B %s", outage.attempts, outage.failureClass, proxy.unavailable.Load(), stillB)
+
+	proxy.down.Store(false)
+	recoveredAt := time.Now()
+	// The bound: the longest a released row can wait for its next attempt, then one frontier cache
+	// interval for the consumer's decisions to reflect it.
+	recovery := backoffMax + frontierTTL() + slack
+	withdrawnB := waitDecision(t, api, b, recovery, "B's revocation to be delivered after the outage",
+		func(d decision) bool { return !d.Allowed && isWithdrawalReason(d.Reason) })
+	for i, p := range backlog {
+		waitDecision(t, api, p, recovery, fmt.Sprintf("backlog principal %d to be served", i+1), allowed)
+	}
+	waitFrontier(t, api, provider, "the backlog to drain", func(f frontierFacts) bool {
+		return !f.Unpublished && !f.SecurityDebt
+	})
+	timeline.mark("after recovery: B %s; all %d backlog grants served; backlog drained %s after the "+
+		"consumer came back (bound %s)", withdrawnB, backlogSize, time.Since(recoveredAt).Round(time.Millisecond), recovery)
+
+	// --- Phase five: a delivery times out before the consumer could commit it. -----------------
+	//
+	// The proxy holds the request past the dispatcher's publish timeout and never forwards it. The
+	// dispatcher cannot know whether the consumer applied it -- that ambiguity is why the consumer
+	// deduplicates -- and must retry. Here the answer is known: it was never applied, so the
+	// principal is still served until the retry lands, and it lands exactly once.
+	target := backlog[0]
+	proxy.stall.Store(true)
+	api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+target.membership+"/revoke"), tenant, nil)
+	timeline.mark("delivery stalled past the %s publish timeout: %s revoked", publishTimeout, target.principal)
+
+	timedOut := waitOutboxRow(t, producerDB, target.membership, 30*time.Second,
+		"the stalled revocation to be recorded as a failed attempt",
+		func(r outboxRow) bool { return r.attempts >= 1 && !r.published })
+	if timedOut.failureClass != "unavailable" {
+		t.Fatalf("a timed-out delivery failed as %q, want unavailable: a timeout is not poison", timedOut.failureClass)
+	}
+	notApplied := decide(t, api, target)
+	if !notApplied.Allowed && isWithdrawalReason(notApplied.Reason) {
+		t.Fatalf("the consumer applied a revocation it never received: %s", notApplied)
+	}
+	timeline.mark("timed out before commit: attempts=%d failure_class=%s (proxy stalled %d request(s)); target %s",
+		timedOut.attempts, timedOut.failureClass, proxy.stalled.Load(), notApplied)
+
+	proxy.stall.Store(false)
+	releasedAt := time.Now()
+	appliedTarget := waitDecision(t, api, target, recovery, "the stalled revocation to be delivered on retry",
+		func(d decision) bool { return !d.Allowed && isWithdrawalReason(d.Reason) })
+	delivered := waitOutboxRow(t, producerDB, target.membership, recovery, "the retried revocation to be published",
+		func(r outboxRow) bool { return r.published })
+	if receipts := receiptCount(t, producerDB, delivered.eventID); receipts != 1 {
+		t.Fatalf("the retried revocation has %d delivery receipts, want exactly one", receipts)
+	}
+	if deadLetterCount(t, producerDB, target.membership) != 0 {
+		t.Fatal("a delivery that timed out before commit was dead-lettered")
+	}
+	timeline.mark("after the stall: target %s, published after %d failed attempt(s), one receipt, %s after release",
+		appliedTarget, delivered.attempts, time.Since(releasedAt).Round(time.Millisecond))
+}
+
+// outboxRow is the latest revocation of one Membership in the producer's outbox.
+type outboxRow struct {
+	eventID      string
+	attempts     int
+	failureClass string
+	published    bool
+}
+
+func waitOutboxRow(t *testing.T, pool *fdb.Pool, membershipID string, within time.Duration, what string,
+	want func(outboxRow) bool) outboxRow {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	var last outboxRow
+	for {
+		found := false
+		err := pool.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+			rows, err := tx.Query(ctx, `
+				SELECT event_id::text, attempts, coalesce(failure_class, ''), published
+				  FROM platform.outbox
+				 WHERE event_type = $1 AND payload->>'membership_id' = $2
+				 ORDER BY sequence DESC
+				 LIMIT 1`, revokedType, membershipID)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			if rows.Next() {
+				found = true
+				return rows.Scan(&last.eventID, &last.attempts, &last.failureClass, &last.published)
+			}
+			return rows.Err()
+		})
+		if err != nil {
+			t.Fatalf("reading platform.outbox: %v", err)
+		}
+		if found && want(last) {
+			return last
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %s for %s; last row: %+v", within, what, last)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func deadLetterCount(t *testing.T, pool *fdb.Pool, membershipID string) int {
+	t.Helper()
+	var n int
+	if err := pool.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM platform.dead_letter
+		    WHERE event_type = $1 AND payload->>'membership_id' = $2`, revokedType, membershipID).Scan(&n)
+	}); err != nil {
+		t.Fatalf("counting dead letters: %v", err)
+	}
+	return n
+}
+
+func receiptCount(t *testing.T, pool *fdb.Pool, eventID string) int {
+	t.Helper()
+	var n int
+	if err := pool.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM platform.delivery_receipt WHERE event_id = $1::uuid`,
+			eventID).Scan(&n)
+	}); err != nil {
+		t.Fatalf("counting receipts: %v", err)
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -684,6 +856,7 @@ func (env environment) dispatcherConfig(endpoint, deliveryToken string) map[stri
 		"DISPATCH_DELIVERY_TOKEN":      deliveryToken,
 		"DISPATCH_INTERVAL":            "200ms",
 		"DISPATCH_IDLE_INTERVAL":       "300ms",
+		"DISPATCH_PUBLISH_TIMEOUT":     publishTimeout.String(),
 	}
 }
 
@@ -822,6 +995,16 @@ type poisonProxy struct {
 	server   *httptest.Server
 	poison   atomic.Bool
 	rejected atomic.Int64
+
+	// down answers 503, the consumer being out of service. The publisher classifies it
+	// unavailable, and a priority row is retried and released, never dead-lettered.
+	down        atomic.Bool
+	unavailable atomic.Int64
+
+	// stall holds the delivery past the dispatcher's publish timeout and never forwards it: a
+	// timeout before the consumer could commit anything.
+	stall   atomic.Bool
+	stalled atomic.Int64
 }
 
 func newPoisonProxy(t *testing.T, target string) *poisonProxy {
@@ -843,6 +1026,24 @@ func newPoisonProxy(t *testing.T, target string) *poisonProxy {
 			// consumer.
 			w.WriteHeader(http.StatusUnprocessableEntity)
 			_, _ = io.WriteString(w, `{"error":"refused by the system-proof proxy to create a security dead letter"}`)
+			return
+		}
+		if p.down.Load() {
+			_, _ = io.Copy(io.Discard, r.Body)
+			p.unavailable.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if p.stall.Load() {
+			_, _ = io.Copy(io.Discard, r.Body)
+			p.stalled.Add(1)
+			// Held until the dispatcher gives up on it, which it does at its publish timeout. The
+			// consumer never sees this request, so nothing can have been committed.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * publishTimeout):
+			}
+			w.WriteHeader(http.StatusGatewayTimeout)
 			return
 		}
 		forward.ServeHTTP(w, r)
