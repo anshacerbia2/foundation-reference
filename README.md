@@ -177,6 +177,19 @@ across real processes:
 6. It suspends the Tenant through the producer's API. B is refused with the Tenant's reason within
    the same bound. Then it restores the Tenant, and B is served again. Both directions are asserted,
    because the restoration is what the snapshot's old shortcut could never deliver.
+7. **The consumer goes down** (the proxy answers `503`). B is revoked and five principals are
+   granted behind it. B's revocation is retried past its local attempts, is recorded
+   `unavailable`, and is not dead-lettered. When the consumer comes back, B is refused as
+   withdrawn and all five are served, within `BackoffMax` plus one frontier interval. This phase
+   found that a standard-lane row used to be dead-lettered at its third attempt. That made a
+   two-second restart into estate-wide security debt, and foundation-platform v0.2.12 fixed it.
+8. **A delivery times out before commit.** The proxy holds it past the dispatcher's publish timeout
+   and never forwards it. The failed attempt is recorded `unavailable`, and the principal is still
+   served, because nothing was applied. Once the hold is lifted the revocation lands on the retry,
+   with exactly one receipt and no dead letter.
+
+Phases 7 and 8 were observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), and run
+on every build from here.
 
 The system itself authors every refusal the proof asserts. The observer only reads them. The CI job
 of the same name checks out `organization-control` at the pinned revision. The P0 closure record
