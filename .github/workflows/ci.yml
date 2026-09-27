@@ -325,6 +325,7 @@ jobs:
       TEST_PROVIDER_PASSWORD: provider
       TEST_DISPATCH_PASSWORD: dispatch
       TEST_RESOLUTION_PASSWORD: resolution
+      TEST_CONSUMER_PASSWORD: consumer
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -402,6 +403,7 @@ jobs:
       TEST_PROVIDER_PASSWORD: provider
       TEST_DISPATCH_PASSWORD: dispatch
       TEST_RESOLUTION_PASSWORD: resolution
+      TEST_CONSUMER_PASSWORD: consumer
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
