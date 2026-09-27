@@ -1,0 +1,102 @@
+# promtool test rules deploy/alerts/foundation-reference.test.yml
+
+rule_files:
+  - foundation-reference.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: refusals, by code
+    interval: 1m
+    input_series:
+      - series: 'reference_enforcement_decisions_total{code="not_bootstrapped",class="LOW_RISK",allowed="false"}'
+        values: '0 0 3'
+      - series: 'reference_enforcement_decisions_total{code="read_failed",class="LOW_RISK",allowed="false"}'
+        values: '0 0 0'
+      - series: 'reference_enforcement_decisions_total{code="stale_zero_tolerance",class="HIGH_CONFIDENTIALITY",allowed="false"}'
+        values: '0+10x12'
+      - series: 'reference_projection_max_age_seconds{deployable="foundation-reference",system="SAD-004"}'
+        values: '60+0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ConsumerNotBootstrapped
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: ConsumerNotBootstrapped
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: The consumer holds no snapshot and is refusing every projection-backed operation.
+              description: Run the bootstrap (cmd/foundation-reference-bootstrap).
+      - eval_time: 2m
+        alertname: ConsumerProjectionUnreadable
+        exp_alerts: []
+      # Zero tolerance is HIGH_CONFIDENTIALITY working as designed, and never alerts.
+      - eval_time: 12m
+        alertname: ConsumerRefusingAsStale
+        exp_alerts: []
+
+  - name: stale refusals sustained for five minutes
+    interval: 1m
+    input_series:
+      - series: 'reference_enforcement_decisions_total{code="stale_security_debt",class="LOW_RISK",allowed="false"}'
+        values: '0+5x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ConsumerRefusingAsStale
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ConsumerRefusingAsStale
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: The consumer has been refusing active members for 5 minutes because it cannot vouch for its model.
+              description: Read the code label. stale_security_debt means organization-control's SecurityDebt alert is firing; stale_owed means the dispatcher is behind.
+
+  - name: projection age against its budget
+    interval: 1m
+    input_series:
+      - series: 'reference_projection_age_seconds{deployable="foundation-reference",system="SAD-004"}'
+        values: '30 90'
+      - series: 'reference_projection_max_age_seconds{deployable="foundation-reference",system="SAD-004"}'
+        values: '60 60'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: ConsumerProjectionOverBudget
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: ConsumerProjectionOverBudget
+        exp_alerts:
+          - exp_labels: { severity: warning, deployable: foundation-reference, system: SAD-004 }
+            exp_annotations:
+              summary: The consumer's projection is older than its configured maximum, so LOW_RISK reads are refused.
+
+  - name: a refused delivery
+    interval: 1m
+    input_series:
+      - series: 'reference_deliveries_total{outcome="refused"}'
+        values: '0 1'
+      - series: 'reference_deliveries_total{outcome="applied"}'
+        values: '0 50'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ConsumerRefusingDeliveries
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: The consumer refused a delivery as poison; the producer will dead-letter it.
+
+  - name: no telemetry
+    interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ConsumerTelemetryAbsent
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: ConsumerTelemetryAbsent
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: foundation-reference has exported no metrics for 10 minutes.
+              description: Either the process is down, OTEL_EXPORTER_OTLP_ENDPOINT is unset, or the Collector is not receiving.

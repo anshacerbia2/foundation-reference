@@ -1,0 +1,65 @@
+# Enforcement alerts for the consumer (organization-control ROADMAP item 14).
+#
+# The series come from internal/telemetry over OTLP, converted to Prometheus names at the Collector:
+# dots to underscores, a seconds unit to _seconds, a counter to _total. internal/telemetry's test
+# fails if a rule reads a series, a code or an outcome the consumer does not produce.
+#
+# The producer-side alerts -- outbox lag, security debt, a consumer past its reporting budget -- are
+# organization-control's (its deploy/alerts). These are what only the consumer can see: that it is
+# refusing, and why.
+
+groups:
+  - name: foundation-reference-enforcement
+    rules:
+      - alert: ConsumerNotBootstrapped
+        expr: sum(increase(reference_enforcement_decisions_total{code="not_bootstrapped"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: The consumer holds no snapshot and is refusing every projection-backed operation.
+          description: Run the bootstrap (cmd/foundation-reference-bootstrap).
+
+      - alert: ConsumerProjectionUnreadable
+        expr: sum(increase(reference_enforcement_decisions_total{code="read_failed"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: The consumer cannot read its own projection, and is refusing.
+
+      - alert: ConsumerRefusingAsStale
+        # Every stale refusal except zero tolerance, which HIGH_CONFIDENTIALITY returns by design.
+        expr: >
+          sum(increase(reference_enforcement_decisions_total{
+            code=~"stale_unknown_age|stale_age|stale_no_frontier|stale_frontier_unreadable|stale_security_debt|stale_owed"
+          }[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The consumer has been refusing active members for 5 minutes because it cannot vouch for its model.
+          description: Read the code label. stale_security_debt means organization-control's SecurityDebt alert is firing; stale_owed means the dispatcher is behind.
+
+      - alert: ConsumerProjectionOverBudget
+        expr: >
+          reference_projection_age_seconds
+            > on (deployable, system) reference_projection_max_age_seconds
+        labels:
+          severity: warning
+        annotations:
+          summary: The consumer's projection is older than its configured maximum, so LOW_RISK reads are refused.
+
+      - alert: ConsumerRefusingDeliveries
+        expr: sum(increase(reference_deliveries_total{outcome="refused"}[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The consumer refused a delivery as poison; the producer will dead-letter it.
+
+      - alert: ConsumerTelemetryAbsent
+        expr: absent(reference_projection_max_age_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: foundation-reference has exported no metrics for 10 minutes.
+          description: Either the process is down, OTEL_EXPORTER_OTLP_ENDPOINT is unset, or the Collector is not receiving.

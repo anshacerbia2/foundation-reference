@@ -152,6 +152,12 @@ type Decision struct {
 	Allow  bool
 	Reason string
 
+	// Code names the branch that decided, from a fixed set (the Code* constants). Reason is for a
+	// person and carries values; Code is for counting, so a refusal metric has bounded labels and an
+	// alert can tell "this principal holds no membership" from "this consumer cannot vouch for
+	// its model".
+	Code string
+
 	// Stale records that the answer came from a projection older than the bound, or from one whose
 	// producer has given up on a delivery.
 	//

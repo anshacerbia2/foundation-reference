@@ -238,6 +238,36 @@ Every route declares its class at declaration, and a test fails if one does not.
 resolved by lookup with a default would give the wrong answer for some route — and the route
 added in a hurry is the one most likely to need the strict one.
 
+## Metrics and alerts
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, the consumer exports over OTLP/HTTP to the OpenTelemetry
+Collector. Unset, it exports nothing and says so at startup.
+
+Every enforcement answer carries a `Code` from a fixed set (`httpapi.DecisionCodes`), one per branch
+of `Decide`, and `TestEveryBranchDecidesWithItsOwnCode` holds each branch to its own. The metrics
+count by that code rather than by the reason text, so labels stay bounded:
+
+| Series (Prometheus name) | What it is |
+| :-- | :-- |
+| `reference_enforcement_decisions_total{class, allowed, code}` | every answer, and why |
+| `reference_deliveries_total{outcome}` | intake outcomes: `applied`, `duplicate`, `superseded`, `acknowledged`, `refused`, `failed` |
+| `reference_projection_age_seconds` | the projection's age; absent while it is cold |
+| `reference_projection_max_age_seconds` | `REFERENCE_MAX_PROJECTION_AGE` |
+
+`deploy/alerts/foundation-reference.rules.yml` alerts on four conditions:
+
+- a consumer with no snapshot, or one that cannot read its projection;
+- sustained stale refusals of active members;
+- a projection older than its budget;
+- a delivery refused as poison.
+
+The producer-side alerts (outbox lag, security debt, a consumer past its reporting budget) are
+organization-control's.
+
+CI checks the rules and runs their unit tests with a pinned `promtool`. A mutation that drops one
+code from the stale alert must fail those tests. `internal/telemetry`'s test fails if a rule reads
+a series, code or outcome that the consumer does not produce.
+
 ## What is deliberately absent
 
 **No row-level security.** RLS in `organization-control` protects authoritative tenant data.

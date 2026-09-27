@@ -14,6 +14,38 @@ import (
 
 var ErrNoProjector = errors.New("httpapi: a projector is required")
 
+// Decision codes. Every branch of Decide sets exactly one.
+const (
+	CodeActiveMembership      = "active_membership"
+	CodeAuthorityGranted      = "authority_granted"
+	CodeAuthorityUnconfigured = "authority_unconfigured"
+	CodeAuthorityUnreachable  = "authority_unreachable"
+	CodeAuthorityRefused      = "authority_refused"
+	CodeNotBootstrapped       = "not_bootstrapped"
+	CodeWithdrawn             = "withdrawn"
+	CodeTenantInactive        = "tenant_inactive"
+	CodeTenantNotProjected    = "tenant_not_projected"
+	CodeNotProjected          = "not_projected"
+	CodeReadFailed            = "read_failed"
+
+	// The stale codes: an active membership refused because this consumer cannot vouch for it.
+	CodeStaleZeroTolerance      = "stale_zero_tolerance"
+	CodeStaleUnknownAge         = "stale_unknown_age"
+	CodeStaleAge                = "stale_age"
+	CodeStaleNoFrontier         = "stale_no_frontier"
+	CodeStaleFrontierUnreadable = "stale_frontier_unreadable"
+	CodeStaleSecurityDebt       = "stale_security_debt"
+	CodeStaleOwed               = "stale_owed"
+)
+
+// DecisionCodes is the complete set, for a metric's label values and a test that holds them.
+var DecisionCodes = []string{
+	CodeActiveMembership, CodeAuthorityGranted, CodeAuthorityUnconfigured, CodeAuthorityUnreachable,
+	CodeAuthorityRefused, CodeNotBootstrapped, CodeWithdrawn, CodeTenantInactive, CodeTenantNotProjected,
+	CodeNotProjected, CodeReadFailed, CodeStaleZeroTolerance, CodeStaleUnknownAge, CodeStaleAge,
+	CodeStaleNoFrontier, CodeStaleFrontierUnreadable, CodeStaleSecurityDebt, CodeStaleOwed,
+}
+
 // Projection is the narrow view the enforcer needs, declared here rather than beside the
 // implementation.
 //
@@ -90,6 +122,7 @@ func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantI
 		return Decision{
 			Allow:  false,
 			Reason: fmt.Sprintf("%s requires the authority and none is configured", class),
+			Code:   CodeAuthorityUnconfigured,
 		}, nil
 	}
 
@@ -101,15 +134,17 @@ func (e *Enforcer) decideFromAuthority(ctx context.Context, class Class, tenantI
 		return Decision{
 			Allow:  false,
 			Reason: fmt.Sprintf("the authority could not be reached: %v", err),
+			Code:   CodeAuthorityUnreachable,
 		}, nil
 	}
 	if !verdict.Granted {
-		return Decision{Allow: false, Reason: "the authority does not grant this context"}, nil
+		return Decision{Allow: false, Reason: "the authority does not grant this context", Code: CodeAuthorityRefused}, nil
 	}
 	return Decision{
 		Allow: true,
 		Reason: fmt.Sprintf("granted by the authority at membership version %d, tenant security version %d",
 			verdict.MembershipVersion, verdict.TenantSecurityVersion),
+		Code: CodeAuthorityGranted,
 	}, nil
 }
 
@@ -124,11 +159,12 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: "this consumer has taken no snapshot, so it holds no projected authority",
+			Code:   CodeNotBootstrapped,
 			Stale:  true,
 		}, nil
 	}
 
-	stale, staleBecause := e.stale(ctx, policy, age, ageErr)
+	stale, staleCode, staleBecause := e.stale(ctx, policy, age, ageErr)
 
 	record, err := e.projector.Lookup(ctx, tenantID, principalID)
 	switch {
@@ -146,6 +182,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 			return Decision{
 				Allow:  true,
 				Reason: fmt.Sprintf("membership active at version %d", record.Version),
+				Code:   CodeActiveMembership,
 				Age:    age,
 			}, nil
 		}
@@ -166,6 +203,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: staleBecause + ", and no class serves past its bound",
+			Code:   staleCode,
 			Stale:  true,
 			Age:    age,
 		}, nil
@@ -181,6 +219,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: "this principal holds no active membership in this tenant",
+			Code:   CodeWithdrawn,
 			Stale:  stale,
 			Age:    age,
 		}, nil
@@ -192,6 +231,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: "the tenant is not active: " + err.Error(),
+			Code:   CodeTenantInactive,
 			Stale:  stale,
 			Age:    age,
 		}, nil
@@ -203,6 +243,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: "no tenant state is projected for this tenant",
+			Code:   CodeTenantNotProjected,
 			Stale:  stale,
 			Age:    age,
 		}, nil
@@ -218,6 +259,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		return Decision{
 			Allow:  false,
 			Reason: "no membership is projected for this principal in this tenant",
+			Code:   CodeNotProjected,
 			Stale:  stale,
 			Age:    age,
 		}, nil
@@ -226,7 +268,7 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 		// The read itself broke. This is never fail-open eligible, whatever the class:
 		// fail-open exists for a projection that is merely behind, not for one that cannot
 		// be read at all.
-		return Decision{Allow: false, Reason: "the projection could not be read"}, err
+		return Decision{Allow: false, Reason: "the projection could not be read", Code: CodeReadFailed}, err
 	}
 }
 
@@ -260,17 +302,17 @@ func (e *Enforcer) decideFromProjection(ctx context.Context, policy Policy, tena
 // broker", the producer's pool empties while the consumer is still behind, and applied progress
 // becomes load-bearing: the verdict will need the gap between HighestCommittedMark and this
 // consumer's AppliedMark, which is why both are already carried and reported.
-func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, ageErr error) (bool, string) {
+func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, ageErr error) (bool, string, string) {
 	if policy.MaxStale == 0 {
 		// A class tolerating nothing does not need a measurement to refuse. Stated first so the
 		// network call below is not made for an answer that cannot change.
-		return true, "this class tolerates no staleness, and a projection is not an authoritative answer"
+		return true, CodeStaleZeroTolerance, "this class tolerates no staleness, and a projection is not an authoritative answer"
 	}
 	if ageErr != nil {
-		return true, "the projection's freshness is unknown"
+		return true, CodeStaleUnknownAge, "the projection's freshness is unknown"
 	}
 	if age > policy.MaxStale {
-		return true, fmt.Sprintf("the projection is %s old, past this class's %s bound",
+		return true, CodeStaleAge, fmt.Sprintf("the projection is %s old, past this class's %s bound",
 			age.Round(time.Millisecond), policy.MaxStale)
 	}
 
@@ -279,12 +321,12 @@ func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, 
 		// out a delivery that never arrived, so the honest answer is stale -- and the class decides
 		// what that costs. Reporting fresh here would be the original defect with extra steps: a
 		// consumer certifying itself current from information that cannot show it is not.
-		return true, "no publication frontier is configured, so an undelivered event cannot be ruled out"
+		return true, CodeStaleNoFrontier, "no publication frontier is configured, so an undelivered event cannot be ruled out"
 	}
 
 	facts, err := e.frontier.Frontier(ctx)
 	if err != nil {
-		return true, fmt.Sprintf("the publication frontier could not be read: %v", err)
+		return true, CodeStaleFrontierUnreadable, fmt.Sprintf("the publication frontier could not be read: %v", err)
 	}
 
 	// The producer's dead-letter debt, before the owed pool and outside every budget.
@@ -308,14 +350,14 @@ func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, 
 	// serving would be the reason nobody ever looked at the table. The producer scopes the count to
 	// the Membership events authority depends on, so an unrelated poison event does not do this.
 	if facts.SecurityDebt {
-		return true, fmt.Sprintf(
+		return true, CodeStaleSecurityDebt, fmt.Sprintf(
 			"the producer has given up on %d authority-bearing delivery(s), the oldest %s ago, "+
 				"and no delivery is owed for them", facts.SecurityDeadLettered,
 			facts.OldestSecurityDeadLetterAge.Round(time.Second))
 	}
 
 	if !facts.Unpublished {
-		return false, ""
+		return false, "", ""
 	}
 
 	// The producer observed its oldest owed delivery at an instant that has since passed, so the age
@@ -335,8 +377,8 @@ func (e *Enforcer) stale(ctx context.Context, policy Policy, age time.Duration, 
 	// it has held the answer.
 	owed := facts.OldestUnpublishedAge + facts.Age(e.now().UTC())
 	if owed > policy.MaxStale {
-		return true, fmt.Sprintf("the producer has owed a delivery for %s, past this class's %s bound",
+		return true, CodeStaleOwed, fmt.Sprintf("the producer has owed a delivery for %s, past this class's %s bound",
 			owed.Round(time.Millisecond), policy.MaxStale)
 	}
-	return false, ""
+	return false, "", ""
 }

@@ -281,6 +281,37 @@ jobs:
           echo "B: setting the receipt on a superseded or acknowledged outcome fails its test"
           mv "$file.orig" "$file"
 
+      # The consumer's alerts (organization-control ROADMAP item 14), checked and unit-tested with
+      # promtool at a pinned, checksummed release. internal/telemetry's test holds the series, codes and
+      # outcomes to what the code produces; this holds the expressions to the behaviour the test states.
+      - name: alert rules
+        run: |
+          version=3.15.0
+          sum=2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0
+          archive=prometheus-$version.linux-amd64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/prometheus/prometheus/releases/download/v$version/$archive"
+          echo "$sum  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          promtool="$RUNNER_TEMP/prometheus-$version.linux-amd64/promtool"
+          cd deploy/alerts
+          "$promtool" check rules foundation-reference.rules.yml
+          "$promtool" test rules foundation-reference.test.yml
+          # Drop the security-debt code from the stale alert: the test that expects it to fire on
+          # sustained stale_security_debt refusals must fail.
+          cp foundation-reference.rules.yml rules.orig
+          sed -i 's/|stale_security_debt//' foundation-reference.rules.yml
+          if cmp -s rules.orig foundation-reference.rules.yml; then
+            echo "::error::the stale code list was not found; this check is silently passing and must be updated"
+            exit 1
+          fi
+          if "$promtool" test rules foundation-reference.test.yml; then
+            echo "::error::the rule tests passed with stale_security_debt no longer alerted, so they do not test the selection"
+            exit 1
+          fi
+          mv rules.orig foundation-reference.rules.yml
+          echo "the alert tests are load-bearing: dropping a code from the stale alert fails them"
+
 
   # Proof A across the process boundary -- the final P0 gate, frozen by the principal review.
   #
