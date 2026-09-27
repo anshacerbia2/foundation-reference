@@ -226,8 +226,8 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 			"by some route other than the one it claims", letter.failureClass)
 	}
 	if letter.priority != outbox.PriorityHigh {
-		t.Fatalf("the dead-lettered revocation sits in lane %d, want the priority lane %d: a standard-"+
-			"lane row dead-letters on unavailability, and the proof would be demonstrating that instead",
+		t.Fatalf("the dead-lettered revocation sits in lane %d, want the priority lane %d: a revocation "+
+			"that did not take the reserved lane would queue behind lifecycle traffic",
 			letter.priority, outbox.PriorityHigh)
 	}
 	// The dispatcher names the consumer that refused the event (foundation-platform v0.2.8), which
