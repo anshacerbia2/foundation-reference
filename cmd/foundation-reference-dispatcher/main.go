@@ -19,10 +19,11 @@
 // # What it may do to the database
 //
 // It authenticates as a login role inheriting `organization_dispatch_rt`: SELECT and UPDATE on
-// `platform.outbox`, SELECT/INSERT/UPDATE on `platform.dead_letter`, and nothing else. Not the
-// provider role — a delivery worker that could mutate every Tenant in the estate would be a second
-// process with the control plane's authority, for a job whose whole scope is moving rows that are
-// already committed.
+// `platform.outbox`; INSERT and SELECT on `platform.dead_letter` and `platform.delivery_receipt`;
+// and SELECT on two columns of `projection.consumer`, to check at startup that its own consumer name
+// is registered. Not the provider role: a delivery worker that could mutate every Tenant in the
+// estate would be a second process with the control plane's authority, for a job whose whole scope
+// is moving rows that are already committed.
 package main
 
 import (
@@ -73,10 +74,10 @@ func run() error {
 		// asks whether a specific consumer holds a specific event -- a question an endpoint
 		// cannot answer, because an endpoint moves and the consumer identity does not.
 		//
-		// It must be the same name the consumer registered with organization-control, and
-		// nothing here can check that: the two are configured separately and this process holds
-		// no provider credential. A mismatch produces receipts nobody's resolution reads, which
-		// is why the name is required rather than derived from the endpoint.
+		// It must be the same name the consumer registered with organization-control. That is
+		// checked once the pool is open (dispatch.CheckRegistered): a mismatch produces receipts
+		// nobody's resolution reads, which is also why the name is required rather than derived
+		// from the endpoint.
 		problems = append(problems, errors.New("DISPATCH_CONSUMER_NAME is required; it must match the name registered with the producer"))
 	}
 	if token == "" {
@@ -117,6 +118,12 @@ func run() error {
 		return fmt.Errorf("outbox database: %w", err)
 	}
 	defer pool.Close()
+
+	// Before any delivery: a dispatcher writing receipts under a name no resolution reads is worse
+	// than one that does not start.
+	if err := dispatch.CheckRegistered(ctx, pool, consumer); err != nil {
+		return err
+	}
 
 	publisher, err := dispatch.NewHTTPPublisher(endpoint, token, timeout, telemetry)
 	if err != nil {

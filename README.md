@@ -134,10 +134,19 @@ The schema must arrive first: the dispatcher refuses to start against an outbox 
 columns. Bump `organization-control` before this repository whenever foundation-platform adds a
 migration.
 
-**Three names must agree, and nothing checks them.** `DISPATCH_CONSUMER_NAME`,
-`REFERENCE_CONSUMER_NAME`, and the consumer_id registered with `organization-control` must be the
-same string. Receipts are keyed by the first, and resolution looks them up by the third. A mismatch
-yields receipts that no resolution will ever find.
+**Three names must agree.** `DISPATCH_CONSUMER_NAME`, `REFERENCE_CONSUMER_NAME`, and the
+consumer_id registered with `organization-control` must be the same string. Receipts are keyed by
+the first, and resolution looks them up by the third. A mismatch yields receipts that no
+resolution will ever find. Two of them are checked:
+
+- **The dispatcher refuses to start** when `DISPATCH_CONSUMER_NAME` is not an active registered
+  consumer (`dispatch.CheckRegistered`). organization-control grants its dispatch role read
+  access to `consumer_id` and `retired_at` of `projection.consumer` for exactly this.
+- **The bootstrap** sends `REFERENCE_CONSUMER_NAME` as the snapshot's consumer. organization-control
+  refuses a consumer it has not registered, and a token naming a different consumer.
+
+The serving consumer's own `REFERENCE_CONSUMER_NAME` keys only its inbox guard, which no resolution
+reads, so it is not checked.
 
 ## Proof A, in two layers
 
