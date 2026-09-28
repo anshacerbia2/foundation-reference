@@ -29,6 +29,13 @@ const source event.Source = "//scnehaux.com/organization-control"
 
 func fixture(t *testing.T) (*projection.Projector, *db.Pool, context.Context) {
 	t.Helper()
+	projector, pool, ctx, _ := fixtureNamed(t)
+	return projector, pool, ctx
+}
+
+// fixtureNamed is fixture, returning the consumer name too, for a test whose payload names it.
+func fixtureNamed(t *testing.T) (*projection.Projector, *db.Pool, context.Context, string) {
+	t.Helper()
 
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -55,11 +62,12 @@ func fixture(t *testing.T) (*projection.Projector, *db.Pool, context.Context) {
 	// first run applied it and every run afterwards saw a duplicate and failed. The tests that mint
 	// their own identifiers never noticed, which is why the suffix belongs here rather than in the
 	// one test that tripped over it.
-	projector, err := projection.New(pool, "test-"+t.Name()+"-"+newID(t).String())
+	name := "test-" + t.Name() + "-" + newID(t).String()
+	projector, err := projection.New(pool, name)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return projector, pool, ctx
+	return projector, pool, ctx, name
 }
 
 func newID(t *testing.T) id.UUID {
@@ -237,13 +245,12 @@ func TestAnUnknownEventTypeIsRefusedRatherThanIgnored(t *testing.T) {
 	projector, _, ctx := fixture(t)
 
 	// Refused, not silently skipped: a consumer that swallows an unrecognised type reports success
-	// for work it never did, and the dispatcher marks the row published. Three kinds of unknown:
-	// a security-class type added upstream, the repair event this consumer cannot yet apply, and a
-	// type from another producer altogether. The types this consumer knowingly does not act on are
+	// for work it never did, and the dispatcher marks the row published. Two kinds of unknown: a
+	// security-class type added upstream, and a type from another producer altogether. The repair
+	// event is applied (repair_integration_test.go). The types this consumer knowingly does not act on are
 	// acknowledged instead; see TestAnEventThisConsumerDoesNotActOnIsAcknowledged.
 	for _, typ := range []event.Type{
 		"com.scnehaux.organization.tenant.security.quarantined",
-		"com.scnehaux.organization.projection.repair.reconciled",
 		"com.scnehaux.billing.invoice.lifecycle.issued",
 	} {
 		envelope := revoked(t, newSubject(t), 1)

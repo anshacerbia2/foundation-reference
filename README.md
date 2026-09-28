@@ -97,8 +97,21 @@ four Tenant types:
 It acknowledges a named list of the producer's other types: Workspace, Organization registry,
 invitation, offboarding progress, and the Tenant intake request. The list is in
 `internal/projection/projection.go`. Every other type is refused as unknown, including a
-security-class type added upstream and `projection.repair.reconciled`, whose corrections this
-consumer cannot yet apply. Refusing them keeps a gap visible rather than silent.
+security-class type added upstream. Refusing them keeps a gap visible rather than silent.
+
+**Reconciliation repairs are applied.** `projection.repair.reconciled` carries one sweep's findings
+for one consumer, each with the authoritative Membership, or `null` when authority never granted
+it (`internal/projection/repair.go`). The whole sweep applies in one transaction under its inbox
+guard:
+
+- a state is written by the rule every Membership event follows: a higher version replaces a
+  lower one, so a sweep that arrives after a newer event changes nothing;
+- a `null` removes the row, and is accepted only on an `extra` finding;
+- a sweep for another consumer is acknowledged.
+
+A `missing` or `mismatch` finding without a state is what a producer from before the state sends.
+The sweep is refused as poison rather than read as a removal, which would delete a Membership
+authority holds.
 
 Before the list existed, every type other than Membership was refused. The dispatcher delivers
 everything the producer publishes, so every Workspace change, invitation and Tenant suspension
@@ -196,6 +209,11 @@ across real processes:
    fails if either maximum exceeds the 6 s that TDD-organization-control-002 §Enforcement Budget
    gives commit-to-claim plus dispatch-to-applied. Accept to commit happens inside one request and
    is not part of this number.
+10. **The projection drifts, and reconciliation repairs it.** The proof deletes a served
+    principal's row from the consumer's database, and inserts an active Membership that authority
+    never granted. The first principal is refused and the invented one is served: the drift.
+    The consumer's report goes to `POST /v1/projections/reconcile`, which must classify the two
+    as `missing` and `extra`. Its repair must then restore the first and remove the second.
 
 Phases 7 and 8 were observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), and phase
 9 replaces Proof A's single 32 ms sample. All three run on every build from here.
