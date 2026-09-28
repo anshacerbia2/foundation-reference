@@ -23,6 +23,8 @@ package systemproof
 //	consumer              receives the whole backlog on recovery (bounded by BackoffMax)
 //	proxy                 holds one delivery past the publish timeout (never forwarded)
 //	dispatcher            retries it, and it is applied exactly once (one receipt)
+//	organization-control  revokes 60 more, 20 of them through a failing first delivery
+//	observer              reports commit-to-applied p50/p95/p99/max for both paths (6 s budget)
 //
 // # Why a proxy, and why it answers 422
 //
@@ -53,6 +55,7 @@ package systemproof
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -426,6 +429,173 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	}
 	timeline.mark("after the stall: target %s, published after %d failed attempt(s), one receipt, %s after release",
 		appliedTarget, delivered.attempts, time.Since(releasedAt).Round(time.Millisecond))
+
+	// --- Phase nine: revocation propagation, as a distribution. ---------------------------------
+	//
+	// One localhost sample was all Proof A had (RESPONSE-6). Measured here from the revocation's
+	// outbox commit to the consumer's inbox record of it: both timestamps are now() on the same
+	// PostgreSQL server, so the difference is on one clock. That is the part of the enforcement
+	// budget the dispatcher and the consumer own (TDD-organization-control-002 §Enforcement Budget:
+	// commit to claim 1 s, dispatch to applied 5 s). Accept to commit happens inside one request and
+	// is not measured here.
+	consumerDB := openConsumer(t, env)
+	smooth := measurePropagation(t, api, tenant, producerDB, consumerDB, smoothSamples)
+	proxy.flaky.Store(true)
+	failing := measurePropagation(t, api, tenant, producerDB, consumerDB, failingSamples)
+	proxy.flaky.Store(false)
+
+	for _, run := range []struct {
+		name    string
+		samples []latencySample
+	}{{"smooth", smooth}, {"failing (first delivery of each refused 503)", failing}} {
+		d := distributionOf(run.samples)
+		timeline.mark("propagation, commit to applied, %s path, n=%d: p50 %s  p95 %s  p99 %s  max %s (budget %s)",
+			run.name, len(run.samples), d.p50, d.p95, d.p99, d.max, propagationBudget)
+		if d.max > propagationBudget {
+			t.Errorf("%s path: the slowest revocation took %s from commit to applied, past the %s budget",
+				run.name, d.max, propagationBudget)
+		}
+	}
+	// The failing path must actually have failed, or its numbers describe the smooth one twice.
+	for _, s := range failing {
+		if s.failedAttempts < 1 {
+			t.Fatalf("a failing-path revocation (%s) was delivered on its first attempt; the path under "+
+				"measurement is not the failing one", s.eventID)
+		}
+	}
+}
+
+const (
+	smoothSamples  = 40
+	failingSamples = 20
+
+	// Commit to dispatch claim (1 s) plus dispatch to consumer applied (5 s).
+	propagationBudget = 6 * time.Second
+)
+
+type latencySample struct {
+	eventID        string
+	latency        time.Duration
+	failedAttempts int
+}
+
+// measurePropagation grants n principals, waits until the consumer holds them, revokes them one after
+// another, and returns each revocation's commit-to-applied latency.
+func measurePropagation(t *testing.T, api *client, tenantToken string, producer, consumer *fdb.Pool, n int) []latencySample {
+	t.Helper()
+	granted := make([]principal, 0, n)
+	memberships := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		p := grant(api, tenantToken)
+		granted = append(granted, p)
+		memberships = append(memberships, p.membership)
+	}
+	waitConsumerRows(t, consumer, memberships, "active", 60*time.Second)
+
+	for _, p := range granted {
+		api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+p.membership+"/revoke"), tenantToken, nil)
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitConsumerRows(t, consumer, memberships, "revoked", 60*time.Second)
+
+	type committed struct {
+		eventID  string
+		at       time.Time
+		attempts int
+	}
+	var rows []committed
+	if err := producer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		result, err := tx.Query(ctx, `
+			SELECT event_id::text, created_at, attempts FROM platform.outbox
+			 WHERE event_type = $1 AND payload->>'membership_id' = ANY ($2::text[])`, revokedType, memberships)
+		if err != nil {
+			return err
+		}
+		defer result.Close()
+		for result.Next() {
+			var c committed
+			if err := result.Scan(&c.eventID, &c.at, &c.attempts); err != nil {
+				return err
+			}
+			rows = append(rows, c)
+		}
+		return result.Err()
+	}); err != nil {
+		t.Fatalf("reading the revocations' commits: %v", err)
+	}
+	if len(rows) != n {
+		t.Fatalf("found %d revocations in the outbox, want %d", len(rows), n)
+	}
+
+	samples := make([]latencySample, 0, n)
+	for _, c := range rows {
+		var applied time.Time
+		if err := consumer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+			return tx.QueryRow(ctx, `SELECT processed_at FROM platform.processed_event
+			    WHERE event_id = $1::uuid AND consumer = $2`, c.eventID, consumerName).Scan(&applied)
+		}); err != nil {
+			t.Fatalf("reading the consumer's record of %s: %v", c.eventID, err)
+		}
+		samples = append(samples, latencySample{eventID: c.eventID, latency: applied.Sub(c.at), failedAttempts: c.attempts})
+	}
+	return samples
+}
+
+// waitConsumerRows waits until the consumer's projection holds every membership in the given status.
+func waitConsumerRows(t *testing.T, consumer *fdb.Pool, memberships []string, status string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		var n int
+		if err := consumer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+			return tx.QueryRow(ctx, `SELECT count(*) FROM projection.membership
+			    WHERE membership_id::text = ANY ($1::text[]) AND membership_status = $2`, memberships, status).Scan(&n)
+		}); err != nil {
+			t.Fatalf("reading the consumer's projection: %v", err)
+		}
+		if n == len(memberships) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %s for %d memberships to be %s at the consumer; %d are", within, len(memberships), status, n)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+type distribution struct{ p50, p95, p99, max time.Duration }
+
+// distributionOf reports nearest-rank percentiles, rounded to the millisecond.
+func distributionOf(samples []latencySample) distribution {
+	latencies := make([]time.Duration, len(samples))
+	for i, s := range samples {
+		latencies[i] = s.latency
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	rank := func(p float64) time.Duration {
+		index := int(float64(len(latencies))*p+0.999999) - 1
+		if index < 0 {
+			index = 0
+		}
+		return latencies[index].Round(time.Millisecond)
+	}
+	return distribution{p50: rank(0.50), p95: rank(0.95), p99: rank(0.99), max: latencies[len(latencies)-1].Round(time.Millisecond)}
+}
+
+func openConsumer(t *testing.T, env environment) *fdb.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := fdb.Open(ctx, fdb.Config{
+		Name:     "systemproof-consumer-observer",
+		DSN:      withDatabase(env.adminDSN, consumerDatabase),
+		MaxConns: 2,
+	})
+	if err != nil {
+		t.Fatalf("opening the consumer database for observation: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
 }
 
 // outboxRow is the latest revocation of one Membership in the producer's outbox.
@@ -1005,6 +1175,12 @@ type poisonProxy struct {
 	// timeout before the consumer could commit anything.
 	stall   atomic.Bool
 	stalled atomic.Int64
+
+	// flaky answers 503 to the first delivery of each event and forwards every later one: one failed
+	// attempt per event, the failing path's latency.
+	flaky    atomic.Bool
+	flakedMu sync.Mutex
+	flaked   map[string]bool
 }
 
 func newPoisonProxy(t *testing.T, target string) *poisonProxy {
@@ -1015,7 +1191,7 @@ func newPoisonProxy(t *testing.T, target string) *poisonProxy {
 	}
 	forward := httputil.NewSingleHostReverseProxy(upstream)
 
-	p := &poisonProxy{}
+	p := &poisonProxy{flaked: map[string]bool{}}
 	p.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if p.poison.Load() {
 			_, _ = io.Copy(io.Discard, r.Body)
@@ -1033,6 +1209,23 @@ func newPoisonProxy(t *testing.T, target string) *poisonProxy {
 			p.unavailable.Add(1)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
+		}
+		if p.flaky.Load() {
+			body, _ := io.ReadAll(r.Body)
+			var envelope struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(body, &envelope)
+			p.flakedMu.Lock()
+			first := !p.flaked[envelope.ID]
+			p.flaked[envelope.ID] = true
+			p.flakedMu.Unlock()
+			if first {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
 		}
 		if p.stall.Load() {
 			_, _ = io.Copy(io.Discard, r.Body)
