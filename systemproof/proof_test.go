@@ -463,6 +463,110 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 				"measurement is not the failing one", s.eventID)
 		}
 	}
+
+	// --- Phase ten: the consumer's projection drifts, and reconciliation repairs it. -----------
+	//
+	// organization-control ROADMAP item 19. The consumer loses a Membership authority holds, and
+	// gains one authority never granted -- the privilege escalation reconciliation exists to catch.
+	// Its report goes to the producer, which publishes one repair carrying the authoritative state;
+	// the consumer applies it, restoring the first and removing the second.
+	lost := grant(api, tenant)
+	waitDecision(t, api, lost, recovery, "a new principal to be served before its row is lost", allowed)
+	consumerExec(t, consumerDB, `DELETE FROM projection.membership WHERE membership_id = $1::uuid`, lost.membership)
+	waitDecision(t, api, lost, frontierTTL()+slack, "the principal whose row was lost to be refused",
+		func(d decision) bool { return !d.Allowed })
+
+	inventedPrincipal, inventedMembership := newIdentifier(t), newIdentifier(t)
+	consumerExec(t, consumerDB, `INSERT INTO projection.membership
+	    (membership_id, tenant_id, principal_id, membership_status, membership_version, applied_mark,
+	     tenant_security_version, applied_at, event_id)
+	    VALUES ($1::uuid, $2::uuid, $3::uuid, 'active', 1, 1, 1, now(), gen_random_uuid())`,
+		inventedMembership, tenantID, inventedPrincipal)
+	invented := principal{principal: inventedPrincipal, membership: inventedMembership,
+		operate: api.token("role=operate&subject=" + inventedPrincipal)}
+	escalated := waitDecision(t, api, invented, frontierTTL()+slack,
+		"the invented Membership to be served, which is the drift", allowed)
+	timeline.mark("drift: %s's row lost (refused); an invented Membership served (%s)", lost.principal, escalated)
+
+	report := consumerReport(t, consumerDB)
+	sweep := api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/projections/reconcile"), provider, report)
+	classes := findingClasses(sweep)
+	if classes[lost.membership] != "missing" || classes[inventedMembership] != "extra" {
+		t.Fatalf("the sweep classified the lost row %q and the invented one %q, want missing and extra: %v",
+			classes[lost.membership], classes[inventedMembership], sweep)
+	}
+	sweptAt := time.Now()
+	timeline.mark("reconciled: %d finding(s), the lost row missing, the invented one extra", len(classes))
+
+	restored := waitDecision(t, api, lost, recovery, "the lost Membership to be repaired", allowed)
+	removed := waitDecision(t, api, invented, recovery, "the invented Membership to be removed",
+		func(d decision) bool { return !d.Allowed })
+	timeline.mark("repaired %s after the sweep: lost row %s; invented %s",
+		time.Since(sweptAt).Round(time.Millisecond), restored, removed)
+}
+
+func newIdentifier(t *testing.T) string {
+	t.Helper()
+	minted, err := id.NewV7()
+	if err != nil {
+		t.Fatalf("minting an identifier: %v", err)
+	}
+	return minted.String()
+}
+
+// consumerExec changes the consumer's projection directly: the drift under test, which no API makes.
+func consumerExec(t *testing.T, consumer *fdb.Pool, statement string, args ...any) {
+	t.Helper()
+	if err := consumer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		_, err := tx.Exec(ctx, statement, args...)
+		return err
+	}); err != nil {
+		t.Fatalf("changing the consumer's projection: %v", err)
+	}
+}
+
+// consumerReport is the consumer's account of its active projection at its applied mark, in the
+// reconcile route's shape.
+func consumerReport(t *testing.T, consumer *fdb.Pool) map[string]any {
+	t.Helper()
+	var mark int64
+	var rows []map[string]any
+	if err := consumer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT applied_mark FROM projection.watermark WHERE consumer = $1`,
+			consumerName).Scan(&mark); err != nil {
+			return err
+		}
+		result, err := tx.Query(ctx, `SELECT membership_id::text, membership_version FROM projection.membership
+		    WHERE membership_status = 'active' ORDER BY membership_id`)
+		if err != nil {
+			return err
+		}
+		defer result.Close()
+		for result.Next() {
+			var membership string
+			var version int64
+			if err := result.Scan(&membership, &version); err != nil {
+				return err
+			}
+			rows = append(rows, map[string]any{"membership_id": membership, "membership_version": version})
+		}
+		return result.Err()
+	}); err != nil {
+		t.Fatalf("reading the consumer's projection for its report: %v", err)
+	}
+	return map[string]any{"consumer_id": consumerName, "mark": mark, "rows": rows}
+}
+
+func findingClasses(sweep map[string]any) map[string]string {
+	out := map[string]string{}
+	findings, _ := sweep["findings"].([]any)
+	for _, raw := range findings {
+		f, _ := raw.(map[string]any)
+		membership, _ := f["membership_id"].(string)
+		class, _ := f["classification"].(string)
+		out[membership] = class
+	}
+	return out
 }
 
 const (

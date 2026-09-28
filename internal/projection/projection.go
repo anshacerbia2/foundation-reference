@@ -95,9 +95,8 @@ var tenantTypes = map[event.Type]bool{
 // Listed by name rather than by a rule such as "anything not security-class". A type added later is
 // still refused until someone decides here whether this consumer needs it, which is the property
 // the refusal existed for: a consumer that silently skips a type it does not recognise reports success
-// for work it never did. projection.repair.reconciled is deliberately absent. It carries corrections
-// this consumer ought to apply and cannot yet (organization-control ROADMAP item 19), and refusing it
-// keeps that gap visible rather than silent.
+// for work it never did. projection.repair.reconciled is absent because it is applied, not
+// acknowledged: see repair.go.
 var acknowledged = map[event.Type]bool{
 	"com.scnehaux.organization.workspace.lifecycle.created":     true,
 	"com.scnehaux.organization.workspace.lifecycle.archived":    true,
@@ -289,6 +288,8 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 		return p.applyTenant(ctx, envelope)
 	case acknowledged[envelope.Type]:
 		return p.acknowledge(ctx, envelope)
+	case envelope.Type == RepairReconciled:
+		return p.applyRepair(ctx, envelope)
 	}
 
 	status, known := statusFor[envelope.Type]
