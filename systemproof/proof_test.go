@@ -94,12 +94,16 @@ const (
 	producerAddress = "127.0.0.1:18099"
 	consumerAddress = "127.0.0.1:18096"
 
-	// The consumer identity. It is fixed by the issuer, which mints consumer tokens carrying
-	// consumer_id "foundation-reference", and it has to agree across three places that are
-	// configured independently: the registration with the producer, the consumer's own name, and
-	// the dispatcher's DISPATCH_CONSUMER_NAME. A disagreement between them is one of the failures
-	// this proof exists to catch, so all three are set from this one constant rather than typed.
+	// The consumer identity. It has to agree across three places that are configured
+	// independently: the registration with the producer, the consumer's own name, and the
+	// dispatcher's DISPATCH_CONSUMER_NAME. A disagreement between them is one of the failures this
+	// proof exists to catch, so all three are set from this one constant rather than typed.
 	consumerName = "foundation-reference"
+
+	// The consumer's workload Principal. organization-control recognizes a consumer token by its
+	// principal_id, registered with the consumer (organization-control ADR-ORG-001 §5.11), and its
+	// dev issuer mints role=consumer tokens naming this one.
+	consumerPrincipal = "55555555-5555-4555-8555-55555555555c"
 
 	// Tenant A from organization-control's scripts/ci-fixture.sql, seeded active. Seeding the Tenant
 	// is setup: the chain under test starts at a Membership.
@@ -180,6 +184,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	api.expect(http.StatusCreated, http.MethodPost, producerURL("/v1/projections/consumers"), provider,
 		map[string]any{
 			"consumer_id":              consumerName,
+			"principal_id":             consumerPrincipal,
 			"projection_version":       "v1",
 			"max_accepted_age_seconds": int(maxProjectionAge / time.Second),
 			"stale_behavior":           "fail_closed",
@@ -1093,17 +1098,14 @@ func (env environment) producerConfig() map[string]string {
 		"ORGANIZATION_TENANT_DATABASE_URL":     env.producerDSN("organization_app", env.runtimePassword),
 		"ORGANIZATION_PROVIDER_DATABASE_URL":   env.producerDSN("organization_provider_app", env.providerPassword),
 		"ORGANIZATION_RESOLUTION_DATABASE_URL": env.producerDSN("organization_resolution_app", env.resolutionPassword),
-		// The consumer's own credential. A producer revision without organization_consumer_rt ignores
-		// it; one with it requires it, since this proof configures consumer authority.
+		// The consumer's own credential, which is what enables consumer authority at the producer.
 		"ORGANIZATION_CONSUMER_DATABASE_URL": env.producerDSN("organization_consumer_app", env.consumerPassword),
 		"ORGANIZATION_TOKEN_ISSUER":          issuerURL,
 		"ORGANIZATION_JWKS_URL":              issuerURL + "/certs",
 		"ORGANIZATION_TOKEN_AUDIENCE":        "organization-control",
-		"ORGANIZATION_TENANT_CLAIM":          "https://scnehaux.com/tenant",
-		"ORGANIZATION_PROVIDER_ROLE":         "provider-admin",
-		"ORGANIZATION_CONSUMER_ROLE":         "projection-consumer",
-		"ORGANIZATION_CONSUMER_CLAIM":        "https://scnehaux.com/consumer_id",
-		"ORGANIZATION_LISTEN_ADDRESS":        producerAddress,
+		// No claim or role names: the producer reads a caller from the standard's claims and its
+		// own records. Its provider is the dev issuer's, whose grant scripts/ci-fixture.sql seeds.
+		"ORGANIZATION_LISTEN_ADDRESS": producerAddress,
 	}
 }
 
