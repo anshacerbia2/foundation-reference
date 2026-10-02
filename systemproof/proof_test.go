@@ -80,6 +80,8 @@ import (
 	fdb "github.com/anshacerbia2/foundation-platform/db"
 	"github.com/anshacerbia2/foundation-platform/id"
 	"github.com/anshacerbia2/foundation-platform/outbox"
+
+	"github.com/anshacerbia2/foundation-reference/internal/projection"
 )
 
 const (
@@ -188,6 +190,9 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 			"projection_version":       "v1",
 			"max_accepted_age_seconds": int(maxProjectionAge / time.Second),
 			"stale_behavior":           "fail_closed",
+			// The registration is the subscription (ADR-GLB-018 §5.1): the producer owes this
+			// consumer a delivery of exactly the types it applies.
+			"event_types": projection.AppliedEventTypes(),
 		})
 
 	a := grant(api, tenant)
@@ -273,7 +278,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	// --- Recovery: replay through the now-transparent proxy, then resolve on the evidence. ------
 
 	api.expect(http.StatusAccepted, http.MethodPost,
-		producerURL("/v1/dead-letters/"+letter.eventID+"/replay"), provider, nil)
+		producerURL("/v1/dead-letters/"+letter.eventID+"/consumers/"+consumerName+"/replay"), provider, nil)
 	timeline.mark("replay accepted")
 
 	receiptConsumer, evidence := waitReceipt(t, producerDB, letter.eventID)
@@ -282,7 +287,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	// The resolver judges the receipt, not this proof. A receipt under another consumer name, or one
 	// carrying transport_accepted, must be refused HERE, by the system, with the system's own reason.
 	status, resolution := api.do(http.MethodPost,
-		producerURL("/v1/dead-letters/"+letter.eventID+"/resolve"), provider, nil)
+		producerURL("/v1/dead-letters/"+letter.eventID+"/consumers/"+consumerName+"/resolve"), provider, nil)
 	if status != http.StatusOK {
 		t.Fatalf("the resolver refused to close the incident (%d): %v", status, resolution)
 	}
@@ -615,8 +620,12 @@ func measurePropagation(t *testing.T, api *client, tenantToken string, producer,
 	var rows []committed
 	if err := producer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
 		result, err := tx.Query(ctx, `
-			SELECT event_id::text, created_at, attempts FROM platform.outbox
-			 WHERE event_type = $1 AND payload->>'membership_id' = ANY ($2::text[])`, revokedType, memberships)
+			SELECT o.event_id::text, o.created_at, d.attempts
+			  FROM platform.outbox o
+			  JOIN platform.outbox_delivery d
+			    ON d.created_at = o.created_at AND d.event_id = o.event_id AND d.consumer = $3
+			 WHERE o.event_type = $1 AND o.payload->>'membership_id' = ANY ($2::text[])`,
+			revokedType, memberships, consumerName)
 		if err != nil {
 			return err
 		}
@@ -724,11 +733,13 @@ func waitOutboxRow(t *testing.T, pool *fdb.Pool, membershipID string, within tim
 		found := false
 		err := pool.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
 			rows, err := tx.Query(ctx, `
-				SELECT event_id::text, attempts, coalesce(failure_class, ''), published
-				  FROM platform.outbox
-				 WHERE event_type = $1 AND payload->>'membership_id' = $2
-				 ORDER BY sequence DESC
-				 LIMIT 1`, revokedType, membershipID)
+				SELECT o.event_id::text, d.attempts, coalesce(d.failure_class, ''), d.published
+				  FROM platform.outbox o
+				  JOIN platform.outbox_delivery d
+				    ON d.created_at = o.created_at AND d.event_id = o.event_id AND d.consumer = $3
+				 WHERE o.event_type = $1 AND o.payload->>'membership_id' = $2
+				 ORDER BY o.sequence DESC
+				 LIMIT 1`, revokedType, membershipID, consumerName)
 			if err != nil {
 				return err
 			}

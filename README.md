@@ -147,6 +147,18 @@ The schema must arrive first: the dispatcher refuses to start against an outbox 
 columns. Bump `organization-control` before this repository whenever foundation-platform adds a
 migration.
 
+**It drains this consumer's deliveries alone** (foundation-platform `v0.3.x`, ADR-GLB-018). Each
+event owes each subscribed consumer a delivery of its own. This dispatcher claims, leases and settles
+the ones owed to `DISPATCH_CONSUMER_NAME`, and a dead letter is that consumer's. Replay, resolve and
+waive therefore name the consumer:
+`POST /v1/dead-letters/{event_id}/consumers/{consumer}/replay`.
+
+**Registration is the subscription.** The consumer registers with `event_types`, and organization-control
+delivers exactly those types. They are `projection.AppliedEventTypes()`: the four Membership and four
+Tenant authority types, and the reconciliation repair. A type outside the subscription is never
+delivered, so it cannot park as poison here. Changing the types clears the consumer's snapshot mark,
+and it bootstraps again.
+
 **Three names must agree.** `DISPATCH_CONSUMER_NAME`, `REFERENCE_CONSUMER_NAME`, and the
 consumer_id registered with `organization-control` must be the same string. Receipts are keyed by
 the first, and resolution looks them up by the third. A mismatch yields receipts that no

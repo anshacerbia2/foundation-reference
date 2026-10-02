@@ -85,9 +85,24 @@ var tenantTypes = map[event.Type]bool{
 	TenantRetired:   true,
 }
 
+// AppliedEventTypes are the producer's event types this consumer applies: the Membership and Tenant
+// authority types and the reconciliation repair. They are what it subscribes to when it registers
+// with organization-control (ADR-GLB-018 §5.1, TDD-organization-control-002 §Consumer Registry), so
+// the producer owes it a delivery of exactly these and of nothing else.
+func AppliedEventTypes() []event.Type {
+	return []event.Type{
+		MembershipGranted, MembershipRestored, MembershipSuspended, MembershipRevoked,
+		TenantActivated, TenantSuspended, TenantRestored, TenantRetired,
+		RepairReconciled,
+	}
+}
+
 // acknowledged are the producer's event types this consumer receives and does not act on.
 //
-// The dispatcher delivers every event the producer publishes, and before this list existed every one
+// Since organization-control delivers only the types a consumer subscribes to (foundation-platform
+// v0.3.0), none of these reaches a consumer registered with AppliedEventTypes. The list stays for a
+// subscription that names more, and for the reason it was written: the dispatcher used to deliver
+// every event the producer published, and before this list existed every one
 // of these was refused as an unknown type -- poison, dead-lettered, and never closable, because a
 // replay is refused again and none of them is a Membership event. So every Workspace change and every
 // invitation left an incident that alerted forever.

@@ -18,8 +18,10 @@
 //
 // # What it may do to the database
 //
-// It authenticates as a login role inheriting `organization_dispatch_rt`: SELECT and UPDATE on
-// `platform.outbox`; INSERT and SELECT on `platform.dead_letter` and `platform.delivery_receipt`;
+// It authenticates as a login role inheriting `organization_dispatch_rt`: SELECT on `platform.outbox`,
+// for the envelope; SELECT and UPDATE on `platform.outbox_delivery`, where it claims, leases and
+// settles the deliveries owed to its own consumer name and no other (ADR-GLB-018 §5.4); INSERT and
+// SELECT on `platform.dead_letter` and `platform.delivery_receipt`;
 // and SELECT on two columns of `projection.consumer`, to check at startup that its own consumer name
 // is registered. Not the provider role: a delivery worker that could mutate every Tenant in the
 // estate would be a second process with the control plane's authority, for a job whose whole scope
