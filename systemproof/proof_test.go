@@ -1113,7 +1113,8 @@ func (env environment) producerConfig() map[string]string {
 		"ORGANIZATION_CONSUMER_DATABASE_URL": env.producerDSN("organization_consumer_app", env.consumerPassword),
 		"ORGANIZATION_TOKEN_ISSUER":          issuerURL,
 		"ORGANIZATION_JWKS_URL":              issuerURL + "/certs",
-		"ORGANIZATION_TOKEN_AUDIENCE":        "organization-control",
+		// The producer's keyless resource registration, never a client (STD-IAM-002 §3.1).
+		"ORGANIZATION_TOKEN_AUDIENCE": "organization-control-api",
 		// No claim or role names: the producer reads a caller from the standard's claims and its
 		// own records. Its provider is the dev issuer's, whose grant scripts/ci-fixture.sql seeds.
 		"ORGANIZATION_LISTEN_ADDRESS": producerAddress,
