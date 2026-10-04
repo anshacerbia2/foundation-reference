@@ -179,7 +179,6 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 
 	api := &client{t: t, http: &http.Client{Timeout: 15 * time.Second}}
 	provider := api.token("role=provider")
-	tenant := api.token("role=tenant&tenant_id=" + tenantID)
 
 	// --- Setup: the consumer is registered and two principals hold active memberships. ---------
 
@@ -195,9 +194,29 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 			"event_types": projection.AppliedEventTypes(),
 		})
 
+	// The Tenant's administrator. A token's tenant_id selects a Tenant and confers nothing
+	// (organization-control ADR-ORG-003): a provider makes the administrator, which gives it a
+	// Membership in the Tenant with the grant, and its token carries acr aal2.
+	administrator, err := id.NewV7()
+	if err != nil {
+		t.Fatalf("minting the administrator: %v", err)
+	}
+	made := api.expect(http.StatusCreated, http.MethodPost, producerURL("/v1/tenants/"+tenantID+"/administrators"),
+		provider, map[string]any{"principal_id": administrator.String()})
+	if created, _ := made["membership_created"].(bool); !created {
+		t.Fatalf("the first administrator's grant made no Membership: %v", made)
+	}
+	tenant := api.token("role=tenant&tenant_id=" + tenantID + "&principal_id=" + administrator.String())
+	timeline.mark("administrator %s granted in organization-control", administrator)
+
 	a := grant(api, tenant)
 	b := grant(api, tenant)
 	timeline.mark("A and B granted in organization-control (A=%s, B=%s)", a.principal, b.principal)
+
+	// A member is not an administrator: A's own token for the Tenant administers nothing.
+	api.expect(http.StatusForbidden, http.MethodPost, producerURL("/v1/memberships"),
+		api.token("role=tenant&tenant_id="+tenantID+"&principal_id="+a.principal), map[string]any{})
+	timeline.mark("A, a member and not an administrator, refused at organization-control")
 
 	// The consumer, bootstrapped from a real snapshot, then the delivery path behind the proxy.
 	consumerToken := api.token("role=consumer")
