@@ -294,6 +294,13 @@ makes every symptom disappear:
   design, so without this the answer to "is anything outstanding?" is *no* while the withdrawal
   sits unresolved
 
+**The decision is STD-IAM-002 §3.5 step 8, the current-state check.** It reads this service's own
+projection: an active Membership for the token's principal in an active Tenant, never a version the
+token carries (STD-IAM-002 1.6.0). A token issued for a Tenant (`tenant_id`, ADR-IAM-006 §5.2) acts
+in that Tenant alone, so one naming another Tenant than the route's is refused with `403` before
+anything is read, and so is a `tenant_id` that is no identifier. A token without one is judged on
+the route's Tenant.
+
 Every route declares its class at declaration, and a test fails if one does not. A class
 resolved by lookup with a default would give the wrong answer for some route — and the route
 added in a hurry is the one most likely to need the strict one.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/anshacerbia2/foundation-platform/event"
@@ -258,6 +259,20 @@ func protected(enforcer *Enforcer, metrics Metrics, operation Operation) http.Ha
 				"error": "the token subject is not a principal identifier",
 			})
 			return
+		}
+
+		// STD-IAM-002 §3.5 step 8. A token issued for a Tenant acts in that Tenant alone, so one
+		// selecting another Tenant than the path names is refused before anything is read. The
+		// current-state check itself is the decision below: an active Membership in an active
+		// Tenant, read from this service's projection rather than from the token.
+		if caller.SelectsTenant {
+			selected, err := id.Parse(strings.TrimSpace(caller.Tenant))
+			if err != nil || selected != tenantID {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "the token was issued for another Tenant than this request names",
+				})
+				return
+			}
 		}
 
 		decision, err := enforcer.Decide(r.Context(), operation.Class, tenantID, principalID)

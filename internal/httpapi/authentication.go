@@ -37,6 +37,9 @@ const (
 	// CallerScope is what an operation caller must carry.
 	CallerScope = "foundation-reference.operate"
 
+	// tenantClaim is the Tenant a token was issued for, when it was asked for one (ADR-IAM-006 §5.2).
+	tenantClaim = "tenant_id"
+
 	// scopeClaim is the claim the estate puts scopes in. It is configuration in a real
 	// deployment because it is a property of the realm; here it is fixed because this
 	// deployable exists to prove one property and a second knob would not help.
@@ -56,6 +59,11 @@ type callerKey struct{}
 type Caller struct {
 	Subject string
 	Role    Role
+
+	// Tenant is the token's tenant_id, and SelectsTenant whether it carried one at all. A token
+	// issued for one Tenant acts in that Tenant alone (STD-IAM-002 §3.2, ADR-IAM-006 §5.2).
+	Tenant        string
+	SelectsTenant bool
 }
 
 // CallerFrom returns the authenticated caller. The second result is false on an
@@ -114,7 +122,9 @@ func Authenticate(verifier *verify.Verifier, role Role) (func(http.Handler) http
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), callerKey{}, Caller{Subject: claims.Subject, Role: role})
+			tenant, _ := claims.String(tenantClaim)
+			ctx := context.WithValue(r.Context(), callerKey{}, Caller{Subject: claims.Subject, Role: role,
+				Tenant: tenant, SelectsTenant: claims.Has(tenantClaim)})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}, nil
