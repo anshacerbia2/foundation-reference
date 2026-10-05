@@ -71,6 +71,12 @@ func signer(t *testing.T) (*rsa.PrivateKey, *verify.Verifier) {
 // well formed, correctly claimed, and refused.
 func token(t *testing.T, key *rsa.PrivateKey, scope string) string {
 	t.Helper()
+	return tokenWith(t, key, scope, nil)
+}
+
+// tokenWith is token carrying extra claims as well.
+func tokenWith(t *testing.T, key *rsa.PrivateKey, scope string, extra map[string]any) string {
+	t.Helper()
 
 	now := time.Now().UTC()
 	header := map[string]any{"alg": "PS256", "typ": "JWT", "kid": testKID}
@@ -82,6 +88,9 @@ func token(t *testing.T, key *rsa.PrivateKey, scope string) string {
 		"nbf":   now.Unix(),
 		"exp":   now.Add(10 * time.Minute).Unix(),
 		"scope": scope,
+	}
+	for name, value := range extra {
+		claims[name] = value
 	}
 
 	encode := func(value any) string {
