@@ -1431,6 +1431,15 @@ func (c *client) do(method, target, token string, body any) (int, map[string]any
 	// every call rather than only on provider ones, because the header is harmless elsewhere and a
 	// forgotten one would present as a 400 from a service that is working.
 	request.Header.Set("X-Administrative-Reason", "system proof: Proof A across the process boundary")
+	// Organization Control refuses a command without an Idempotency-Key (TDD-organization-control-003
+	// 1.10.0). Each call is a distinct request, so each gets its own key.
+	if method == http.MethodPost {
+		key, err := id.NewV7()
+		if err != nil {
+			c.t.Fatalf("minting an idempotency key: %v", err)
+		}
+		request.Header.Set("Idempotency-Key", key.String())
+	}
 
 	response, err := c.http.Do(request)
 	if err != nil {
