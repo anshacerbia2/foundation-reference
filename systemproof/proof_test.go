@@ -243,8 +243,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	// --- Phase one: A's revocation is poisoned into a real security dead letter. --------------
 
 	proxy.poison.Store(true)
-	api.expect(http.StatusOK, http.MethodPost,
-		producerURL("/v1/memberships/"+a.membership+"/revoke"), tenant, nil)
+	revoke(api, tenant, a)
 	timeline.mark("A revoked in organization-control; the proxy is answering 422")
 
 	letter := waitDeadLetter(t, producerDB, a.membership)
@@ -379,7 +378,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	// revocation is a priority event, so the dispatcher must retry it past its local attempts and
 	// release it rather than dead-letter it: an outage is not poison. Five grants queue behind it.
 	proxy.down.Store(true)
-	api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+b.membership+"/revoke"), tenant, nil)
+	revoke(api, tenant, b)
 	backlog := make([]principal, 0, backlogSize)
 	for i := 0; i < backlogSize; i++ {
 		backlog = append(backlog, grant(api, tenant))
@@ -428,7 +427,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	// principal is still served until the retry lands, and it lands exactly once.
 	target := backlog[0]
 	proxy.stall.Store(true)
-	api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+target.membership+"/revoke"), tenant, nil)
+	revoke(api, tenant, target)
 	timeline.mark("delivery stalled past the %s publish timeout: %s revoked", publishTimeout, target.principal)
 
 	timedOut := waitOutboxRow(t, producerDB, target.membership, 30*time.Second,
@@ -626,7 +625,7 @@ func measurePropagation(t *testing.T, api *client, tenantToken string, producer,
 	waitConsumerRows(t, consumer, memberships, "active", 60*time.Second)
 
 	for _, p := range granted {
-		api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+p.membership+"/revoke"), tenantToken, nil)
+		revoke(api, tenantToken, p)
 		time.Sleep(50 * time.Millisecond)
 	}
 	waitConsumerRows(t, consumer, memberships, "revoked", 60*time.Second)
@@ -1462,6 +1461,7 @@ func (c *client) expect(status int, method, target, token string, body any) map[
 type principal struct {
 	principal  string
 	membership string
+	version    int64  // the membership_version the grant returned, which a transition must name
 	operate    string // a token whose subject is this principal, for the consumer's operations
 }
 
@@ -1483,11 +1483,26 @@ func grant(c *client, tenantToken string) principal {
 	if membershipID == "" {
 		c.t.Fatalf("the grant returned no membership identifier: %v", result)
 	}
+	version, _ := view["version"].(float64)
+	if version < 1 {
+		c.t.Fatalf("the grant returned no membership version: %v", result)
+	}
 	return principal{
 		principal:  minted.String(),
 		membership: membershipID,
+		version:    int64(version),
 		operate:    c.token("role=operate&subject=" + minted.String()),
 	}
+}
+
+// revoke withdraws a principal's Membership at the version its grant returned. organization-control
+// requires the version on every Membership transition and a reason on a revocation
+// (TDD-organization-control-002 1.9.0 §API); the reason travels on every call (see do). Each
+// principal here is revoked straight after its grant, so that version is the stored one.
+func revoke(c *client, tenantToken string, p principal) {
+	c.t.Helper()
+	c.expect(http.StatusOK, http.MethodPost, producerURL("/v1/memberships/"+p.membership+"/revoke"), tenantToken,
+		map[string]any{"expected_version": p.version})
 }
 
 type decision struct {
