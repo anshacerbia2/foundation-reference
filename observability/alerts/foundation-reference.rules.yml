@@ -5,7 +5,7 @@
 # fails if a rule reads a series, a code or an outcome the consumer does not produce.
 #
 # The producer-side alerts -- outbox lag, security debt, a consumer past its reporting budget -- are
-# organization-control's (its deploy/alerts). These are what only the consumer can see: that it is
+# organization-control's (its observability/alerts). These are what only the consumer can see: that it is
 # refusing, and why.
 
 groups:

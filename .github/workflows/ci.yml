@@ -294,7 +294,7 @@ jobs:
           echo "$sum  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           promtool="$RUNNER_TEMP/prometheus-$version.linux-amd64/promtool"
-          cd deploy/alerts
+          cd observability/alerts
           "$promtool" check rules foundation-reference.rules.yml
           "$promtool" test rules foundation-reference.test.yml
           # Drop the security-debt code from the stale alert: the test that expects it to fire on

@@ -1,6 +1,6 @@
 // Package telemetry is the consumer's half of organization-control's ROADMAP item 14: how often and
 // why this consumer refuses, what its intake did with each delivery, and how old its projection is
-// against its budget. The alert rules in deploy/alerts read these.
+// against its budget. The alert rules in observability/alerts read these.
 package telemetry
 
 import (

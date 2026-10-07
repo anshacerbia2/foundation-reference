@@ -1,4 +1,4 @@
-# promtool test rules deploy/alerts/foundation-reference.test.yml
+# promtool test rules observability/alerts/foundation-reference.test.yml
 
 rule_files:
   - foundation-reference.rules.yml
