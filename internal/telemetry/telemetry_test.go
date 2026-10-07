@@ -108,7 +108,7 @@ var ruleSeries = regexp.MustCompile(`\breference_[a-z_]+\b`)
 // Every series a rule reads must be one this package exports, and every code a rule selects must
 // be one the enforcer can produce.
 func TestTheRulesReadOnlyWhatIsExported(t *testing.T) {
-	rules, err := os.ReadFile("../../deploy/alerts/foundation-reference.rules.yml")
+	rules, err := os.ReadFile("../../observability/alerts/foundation-reference.rules.yml")
 	if err != nil {
 		t.Fatalf("reading the rules: %v", err)
 	}

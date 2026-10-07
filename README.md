@@ -321,7 +321,7 @@ count by that code rather than by the reason text, so labels stay bounded:
 | `reference_projection_age_seconds` | the projection's age; absent while it is cold |
 | `reference_projection_max_age_seconds` | `REFERENCE_MAX_PROJECTION_AGE` |
 
-`deploy/alerts/foundation-reference.rules.yml` alerts on four conditions:
+`observability/alerts/foundation-reference.rules.yml` alerts on four conditions:
 
 - a consumer with no snapshot, or one that cannot read its projection;
 - sustained stale refusals of active members;
