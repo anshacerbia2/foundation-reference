@@ -27,6 +27,9 @@ const (
 	testIssuer   = "https://issuer.test"
 	testAudience = "foundation-reference"
 	testKID      = "test-key"
+
+	// testWorkload is the producer's workload, the one principal_id the intake admits.
+	testWorkload = "55555555-5555-4555-8555-55555555550b"
 )
 
 // keyBits is foundation-platform's floor rather than a preference: verify discards any RSA
@@ -113,9 +116,20 @@ func tokenWith(t *testing.T, key *rsa.PrivateKey, scope string, extra map[string
 	return signing + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
+// deliveryToken is the producer's workload token: the delivery scope, naming the configured
+// workload.
+func deliveryToken(t *testing.T, key *rsa.PrivateKey) string {
+	t.Helper()
+	return tokenWith(t, key, httpapi.DeliveryScope, map[string]any{"principal_id": testWorkload, "subject_type": "workload"})
+}
+
 func middleware(t *testing.T, verifier *verify.Verifier, role httpapi.Role) func(http.Handler) http.Handler {
 	t.Helper()
-	built, err := httpapi.Authenticate(verifier, role)
+	workload := ""
+	if role == httpapi.RoleDelivery {
+		workload = testWorkload
+	}
+	built, err := httpapi.Authenticate(verifier, role, workload)
 	if err != nil {
 		t.Fatalf("Authenticate(%s): %v", role, err)
 	}
@@ -167,9 +181,44 @@ func TestADeliveryTokenIsAcceptedOnTheIntakeRole(t *testing.T) {
 	key, verifier := signer(t)
 	chain := middleware(t, verifier, httpapi.RoleDelivery)
 
-	recorder := served(t, chain, "Bearer "+token(t, key, httpapi.DeliveryScope))
+	recorder := served(t, chain, "Bearer "+deliveryToken(t, key))
 	if recorder.Code != http.StatusNoContent {
 		t.Errorf("status %d, want 204: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestOnlyTheConfiguredWorkloadMayDeliver: the delivery scope is something a realm can grant to
+// any client, so the intake admits only the producer's workload principal_id (ADR-GLB-018 §5.4),
+// the three conditions identity-control's intake holds Organization Control's token to.
+func TestOnlyTheConfiguredWorkloadMayDeliver(t *testing.T) {
+	key, verifier := signer(t)
+	chain := middleware(t, verifier, httpapi.RoleDelivery)
+
+	for name, extra := range map[string]map[string]any{
+		"no principal_id":       {"subject_type": "workload"},
+		"another workload":      {"principal_id": "55555555-5555-4555-8555-55555555550c", "subject_type": "workload"},
+		"a person":              {"principal_id": testWorkload, "subject_type": "human"},
+		"no subject_type":       {"principal_id": testWorkload},
+		"a tenant-scoped token": {"principal_id": testWorkload, "subject_type": "workload", "tenant_id": "11111111-1111-4111-8111-11111111111a"},
+	} {
+		recorder := served(t, chain, "Bearer "+tokenWith(t, key, httpapi.DeliveryScope, extra))
+		if recorder.Code != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403: %s", name, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+// The delivery role cannot be mounted without the workload it admits, and the caller role admits none.
+func TestTheDeliveryRoleNeedsItsWorkload(t *testing.T) {
+	_, verifier := signer(t)
+	if _, err := httpapi.Authenticate(verifier, httpapi.RoleDelivery, ""); !errors.Is(err, httpapi.ErrNoDeliveringWorkload) {
+		t.Errorf("a delivery role with no workload answered %v", err)
+	}
+	if _, err := httpapi.Authenticate(verifier, httpapi.RoleDelivery, "organization-control"); err == nil {
+		t.Error("a delivering workload that is not a principal_id was accepted")
+	}
+	if _, err := httpapi.Authenticate(verifier, httpapi.RoleCaller, testWorkload); err == nil {
+		t.Error("the caller role accepted a delivering workload")
 	}
 }
 
@@ -190,7 +239,7 @@ func TestADeliveryTokenCannotInvokeOperations(t *testing.T) {
 	key, verifier := signer(t)
 	caller := middleware(t, verifier, httpapi.RoleCaller)
 
-	recorder := served(t, caller, "Bearer "+token(t, key, httpapi.DeliveryScope))
+	recorder := served(t, caller, "Bearer "+deliveryToken(t, key))
 	if recorder.Code != http.StatusForbidden {
 		t.Errorf("status %d, want 403: a delivery token was accepted on an operation", recorder.Code)
 	}
@@ -231,7 +280,7 @@ func TestATokenFromAnotherIssuerIsRefused(t *testing.T) {
 		t.Fatalf("verify.New: %v", err)
 	}
 
-	recorder := served(t, middleware(t, other, httpapi.RoleDelivery), "Bearer "+token(t, key, httpapi.DeliveryScope))
+	recorder := served(t, middleware(t, other, httpapi.RoleDelivery), "Bearer "+deliveryToken(t, key))
 	if recorder.Code != http.StatusUnauthorized {
 		t.Errorf("status %d, want 401 for a token from another issuer", recorder.Code)
 	}
@@ -239,13 +288,13 @@ func TestATokenFromAnotherIssuerIsRefused(t *testing.T) {
 
 func TestAnUnknownRoleCannotBeMounted(t *testing.T) {
 	_, verifier := signer(t)
-	if _, err := httpapi.Authenticate(verifier, httpapi.Role("auditor")); err == nil {
+	if _, err := httpapi.Authenticate(verifier, httpapi.Role("auditor"), ""); err == nil {
 		t.Error("Authenticate accepted a role with no scope mapping")
 	}
 }
 
 func TestAMissingVerifierIsRefused(t *testing.T) {
-	if _, err := httpapi.Authenticate(nil, httpapi.RoleDelivery); err == nil {
+	if _, err := httpapi.Authenticate(nil, httpapi.RoleDelivery, testWorkload); err == nil {
 		t.Error("Authenticate accepted a nil verifier")
 	}
 }

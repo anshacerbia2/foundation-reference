@@ -154,11 +154,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("verifier: %w", err)
 	}
 
-	delivery, err := httpapi.Authenticate(verifier, httpapi.RoleDelivery)
+	delivery, err := httpapi.Authenticate(verifier, httpapi.RoleDelivery, cfg.DeliveryPrincipal)
 	if err != nil {
 		return fmt.Errorf("delivery authentication: %w", err)
 	}
-	caller, err := httpapi.Authenticate(verifier, httpapi.RoleCaller)
+	caller, err := httpapi.Authenticate(verifier, httpapi.RoleCaller, "")
 	if err != nil {
 		return fmt.Errorf("caller authentication: %w", err)
 	}
@@ -212,6 +212,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	logger.Info("listening",
 		slog.String("address", listener.Addr().String()),
 		slog.String("consumer", cfg.ConsumerName),
+		slog.String("delivering_workload", cfg.DeliveryPrincipal),
 		slog.Duration("max_projection_age", cfg.MaxProjectionAge))
 
 	serveErr := make(chan error, 1)

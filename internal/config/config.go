@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/anshacerbia2/foundation-platform/id"
 )
 
 const (
@@ -65,6 +67,13 @@ type Config struct {
 	JWKSURL       string
 	TokenMaxSkew  time.Duration
 
+	// DeliveryPrincipal is REFERENCE_DELIVERY_PRINCIPAL_ID: organization-control's workload
+	// principal_id, the one caller the delivery intake admits (ADR-GLB-018 §5.4), as
+	// identity-control's IDENTITY_DELIVERY_PRINCIPAL_ID is. Required rather than optional, for the
+	// verifier's reason: an intake that started without it would admit nothing, and the cause
+	// would surface as every delivery refused rather than as a process that did not start.
+	DeliveryPrincipal string
+
 	HTTPReadTimeout    time.Duration
 	HTTPWriteTimeout   time.Duration
 	HTTPRequestTimeout time.Duration
@@ -114,6 +123,14 @@ func Load() (Config, error) {
 	if cfg.TokenMaxSkew > 60*time.Second {
 		problems = append(problems, fmt.Errorf(
 			"REFERENCE_TOKEN_MAX_SKEW is %s; STD-IAM-002 §3.5 caps clock skew at 60s", cfg.TokenMaxSkew))
+	}
+
+	cfg.DeliveryPrincipal = strings.TrimSpace(os.Getenv("REFERENCE_DELIVERY_PRINCIPAL_ID"))
+	if cfg.DeliveryPrincipal == "" {
+		problems = append(problems, errors.New("REFERENCE_DELIVERY_PRINCIPAL_ID is required: the delivery intake "+
+			"admits organization-control's workload principal_id and no other"))
+	} else if _, err := id.Parse(cfg.DeliveryPrincipal); err != nil {
+		problems = append(problems, fmt.Errorf("REFERENCE_DELIVERY_PRINCIPAL_ID is not a principal_id: %q", cfg.DeliveryPrincipal))
 	}
 
 	cfg.MaxProjectionAge = durationOr("REFERENCE_MAX_PROJECTION_AGE", 60*time.Second, &problems)

@@ -159,6 +159,28 @@ jobs:
           echo "the bound is load-bearing: restoring fail-open fails the enforcement tests"
           mv "$file.orig" "$file"
 
+      # The intake admits organization-control's workload principal_id alone (ADR-GLB-018 §5.4,
+      # REFERENCE_DELIVERY_PRINCIPAL_ID). Without the check, any token carrying the delivery scope --
+      # a scope a realm can grant to any client -- writes this projection, and nothing else in the
+      # suite would notice.
+      - name: only the configured workload may deliver
+        run: |
+          file=internal/httpapi/authentication.go
+          cp "$file" "$file.orig"
+          sed -i -E 's/case principal != workload:/case false \&\& principal != workload:/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the delivering workload check was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/httpapi -count=1 -run 'TestOnlyTheConfiguredWorkloadMayDeliver'; then
+            echo "::error::the suite passed with any workload admitted to the intake, so it does not test the check"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the workload check is load-bearing: admitting another workload fails the intake test"
+          mv "$file.orig" "$file"
+
       - name: the producer's dead-letter debt is load-bearing
         run: |
           file=internal/httpapi/enforce.go
