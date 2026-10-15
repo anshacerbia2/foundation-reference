@@ -9,12 +9,13 @@ It is a separate module and a separate database on purpose. A consumer living in
 event, and the property under test would stop being a property of the event path.
 
 ```text
-membership.revoked → outbox → dispatcher (dispatch.HTTPPublisher) → THIS → operation refused
+membership.revoked → outbox → organization-control's dispatcher (outbox/httpdelivery) → THIS → operation refused
 ```
 
-It also hosts that dispatcher. ADR-ORG-001 §5.4 forbids outbound HTTP from `organization-control`,
-so the process that reads its outbox and delivers over HTTP lives here, holding a database role that
-inherits `organization_dispatch_rt` and nothing more.
+It delivers nothing itself. `organization-control` runs the dispatcher in its own process and pushes
+each delivery here as its workload (ADR-GLB-018 §5.4). This repository shipped a dispatcher of its
+own until 2026-10-15, with a static bearer token and a credential to the producer's database.
+ADR-GLB-018 Alternative G, as amended that day, records its removal.
 
 ## Running it
 
@@ -22,13 +23,20 @@ inherits `organization_dispatch_rt` and nothing more.
 make env               once
 make migrate           platform schema (processed_event), then projection.membership
 make run               the consumer on 127.0.0.1:8096
-make dispatch          the dispatcher, delivering organization-control's outbox to the consumer
 make gates             build, vet, unit and integration tests
 make system-proof      Proof A across real processes (see below); needs .env and a producer checkout
 ```
 
 CI runs more than `make gates`: mutation gates that break a property and require its test to fail,
 and the `system-proof` job.
+
+**Deliveries come from organization-control.** To feed a consumer running here, run
+`organization-control` (`make issuer`, then `make run`, in that repository) with this consumer as a
+delivery target. Its `.env.example` has the block to uncomment:
+`ORGANIZATION_DELIVERY_TARGETS=foundation-reference=http://127.0.0.1:8096/v1/deliveries`, the dispatch
+credential, and a workload key pair that its dev issuer verifies. Set `REFERENCE_DELIVERY_PRINCIPAL_ID`
+here to the principal_id that issuer names. `make deliver F=envelope.json` still posts one envelope by
+hand, with a token you supply.
 
 ## The two properties it rests on
 
@@ -56,14 +64,15 @@ the real-world failure:
 
 ## Delivery, and the evidence it returns
 
-**The publisher classifies; the platform decides.** `dispatch.HTTPPublisher` posts the envelope and
-maps the consumer's answer. foundation-platform's dispatcher then decides the event's fate:
+**The publisher classifies; the platform decides.** foundation-platform's `outbox/httpdelivery`,
+run by organization-control, posts the envelope and maps the consumer's answer. foundation-platform's
+dispatcher then decides the event's fate:
 
 | Consumer answer | Publisher returns | Dispatcher does |
 | :-- | :-- | :-- |
 | `2xx` | a receipt | records the delivery receipt |
 | `400`, `409`, `422` | poison | dead-letters it at once |
-| anything else (`401`, `403`, `429`, `5xx`), or a timeout | unavailable | retries 3 times; then a priority event is **released** for later delivery and a standard one is dead-lettered |
+| anything else (`401`, `403`, `429`, `5xx`), or a timeout | unavailable | retries 3 times; then the event is **released** for later delivery, in either lane (foundation-platform v0.2.12). A `401` also drops the cached workload token |
 
 So a security event is never abandoned because the consumer was down, only because the consumer
 refused it. A timeout is ambiguous, because the consumer may have committed, and it is safe only
@@ -130,11 +139,13 @@ The superseded row is why a dead letter that a newer version has overtaken can n
 receipt of the newer event (see its TDD-005). The missing marker on this row is what keeps that
 distinction honest.
 
-**The dispatcher is built here, so this repository's `go.mod` decides its foundation-platform
-version.** `organization-control` applies the platform schema, and this dispatcher drains it. Until
-`v0.2.10` it ran `v0.2.6`, so two dispatcher changes built for `organization-control` never reached
-the running system: naming the refusing consumer on a dead letter (`v0.2.8`) and the outbox lease
-(`v0.2.10`).
+**The dispatcher is organization-control's, so its `go.mod` decides the dispatcher's
+foundation-platform version.** `organization-control` applies the platform schema and drains it with
+the same version. While the dispatcher was built here, this repository's version was the one that ran:
+until `v0.2.10` it ran `v0.2.6`, so two dispatcher changes built for `organization-control` never
+reached the running system. Those changes were naming the refusing consumer on a dead letter (`v0.2.8`)
+and the outbox lease (`v0.2.10`). That skew is gone. This repository's version now matters only for
+the inbox guard, the envelope and the verifier.
 
 The lease works like this:
 
@@ -143,15 +154,20 @@ The lease works like this:
 - Each outcome commits on its own.
 - A crashed dispatcher's rows wait up to 30 s before another worker takes them.
 
-The schema must arrive first: the dispatcher refuses to start against an outbox without the lease
-columns. Bump `organization-control` before this repository whenever foundation-platform adds a
-migration.
-
-**It drains this consumer's deliveries alone** (foundation-platform `v0.3.x`, ADR-GLB-018). Each
-event owes each subscribed consumer a delivery of its own. This dispatcher claims, leases and settles
-the ones owed to `DISPATCH_CONSUMER_NAME`, and a dead letter is that consumer's. Replay, resolve and
-waive therefore name the consumer:
+**It drains this consumer's deliveries alone** (ADR-GLB-018). Each event owes each subscribed
+consumer a delivery of its own. organization-control runs one dispatcher per delivery target, and the
+one for this consumer claims, leases and settles the deliveries owed to its target name, so a dead
+letter is this consumer's. Replay, resolve and waive therefore name the consumer:
 `POST /v1/dead-letters/{event_id}/consumers/{consumer}/replay`.
+
+**Only organization-control's workload may deliver.** `POST /v1/deliveries` admits a token that
+carries scope `foundation-reference.deliver`, names `REFERENCE_DELIVERY_PRINCIPAL_ID` as its
+`principal_id`, has `subject_type` `workload`, and carries no `tenant_id`. Anything else is `403`.
+The scope alone is not enough, because a realm can grant a scope to any client, and the intake
+writes the projection that decides other people's operations. ADR-GLB-018 §5.4: "The consumer's
+acceptance API admits that workload alone". identity-control's intake holds Organization Control's
+token to the same three conditions (`IDENTITY_DELIVERY_PRINCIPAL_ID`). The variable is required, and
+a CI mutation that admits any workload must turn `TestOnlyTheConfiguredWorkloadMayDeliver` red.
 
 **Registration is the subscription.** The consumer registers with `event_types`, and organization-control
 delivers exactly those types. They are `projection.AppliedEventTypes()`: the four Membership and four
@@ -159,14 +175,15 @@ Tenant authority types, and the reconciliation repair. A type outside the subscr
 delivered, so it cannot park as poison here. Changing the types clears the consumer's snapshot mark,
 and it bootstraps again.
 
-**Three names must agree.** `DISPATCH_CONSUMER_NAME`, `REFERENCE_CONSUMER_NAME`, and the
-consumer_id registered with `organization-control` must be the same string. Receipts are keyed by
-the first, and resolution looks them up by the third. A mismatch yields receipts that no
-resolution will ever find. Two of them are checked:
+**Three names must agree.** This consumer's name in organization-control's
+`ORGANIZATION_DELIVERY_TARGETS`, `REFERENCE_CONSUMER_NAME`, and the consumer_id registered with
+`organization-control` must be the same string. Receipts are keyed by the first, and resolution looks
+them up by the third. A mismatch yields receipts that no resolution will ever find. Two of them are
+checked:
 
-- **The dispatcher refuses to start** when `DISPATCH_CONSUMER_NAME` is not an active registered
-  consumer (`dispatch.CheckRegistered`). organization-control grants its dispatch role read
-  access to `consumer_id` and `retired_at` of `projection.consumer` for exactly this.
+- **organization-control runs no dispatcher for a target** whose name is not an active registered
+  consumer. It waits for the registration instead (its TDD-005 §Technical Context). Its dispatch
+  role reads `consumer_id` and `retired_at` of `projection.consumer` for exactly this.
 - **The bootstrap** sends `REFERENCE_CONSUMER_NAME` as the snapshot's consumer. organization-control
   refuses a consumer it has not registered, and a token naming a different consumer.
 
@@ -189,7 +206,11 @@ A CI mutation of the withdrawal check must turn this test red.
 across real processes:
 
 1. It starts `organization-control` at the revision pinned in `systemproof/organization-control.rev`,
-   its dev issuer, this consumer, and the dispatcher, each with a hermetic environment.
+   its dev issuer, and this consumer, each with a hermetic environment. organization-control
+   delivers here from its own process, through the proxy. Its target is
+   `foundation-reference=<proxy>/v1/deliveries`, and it authenticates with a workload token from the
+   dev issuer's client credentials grant, signed with a 3072-bit key the test generates. Its poll
+   and idle intervals are `200ms` and `300ms`. The proxy answers `503` until this consumer is up.
 2. A proxy in front of the consumer answers `422` while A's revocation is delivered, so the
    revocation itself is dead-lettered as poison in the priority lane, naming this consumer as the
    one that refused it.
@@ -208,7 +229,7 @@ across real processes:
    withdrawn and all five are served, within `BackoffMax` plus one frontier interval. This phase
    found that a standard-lane row used to be dead-lettered at its third attempt. That made a
    two-second restart into estate-wide security debt, and foundation-platform v0.2.12 fixed it.
-8. **A delivery times out before commit.** The proxy holds it past the dispatcher's publish timeout
+8. **A delivery times out before commit.** The proxy holds it past organization-control's delivery timeout
    and never forwards it. The failed attempt is recorded `unavailable`, and the principal is still
    served, because nothing was applied. Once the hold is lifted the revocation lands on the retry,
    with exactly one receipt and no dead letter.
@@ -347,9 +368,10 @@ interface, so a broker would land in one adapter. A broker also cannot produce t
 application marker, so adding one would degrade every receipt to `transport_accepted`.
 Resolution would then stop finding evidence, loudly, which is intended.
 
-**Authentication is not optional.** `Routes` refuses to mount without its middlewares. The
-dispatcher authenticates with scope `foundation-reference.deliver`, and callers with
-`foundation-reference.operate`, against the issuer in `REFERENCE_TOKEN_ISSUER`.
+**Authentication is not optional.** `Routes` refuses to mount without its middlewares.
+organization-control's workload delivers with scope `foundation-reference.deliver` and the
+`principal_id` in `REFERENCE_DELIVERY_PRINCIPAL_ID`, and callers use `foundation-reference.operate`,
+against the issuer in `REFERENCE_TOKEN_ISSUER`.
 
 ## Registered baseline, and why it is use_with_marker
 
