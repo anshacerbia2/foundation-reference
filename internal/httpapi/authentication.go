@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/anshacerbia2/foundation-platform/id"
 	"github.com/anshacerbia2/foundation-platform/verify"
 )
 
@@ -40,6 +41,11 @@ const (
 	// tenantClaim is the Tenant a token was issued for, when it was asked for one (ADR-IAM-006 §5.2).
 	tenantClaim = "tenant_id"
 
+	// principalClaim and subjectTypeClaim name who a token is for (STD-IAM-002 §3.1.1). A delivery
+	// is admitted only from one workload principal_id, the producer's.
+	principalClaim   = "principal_id"
+	subjectTypeClaim = "subject_type"
+
 	// scopeClaim is the claim the estate puts scopes in. It is configuration in a real
 	// deployment because it is a property of the realm; here it is fixed because this
 	// deployable exists to prove one property and a second knob would not help.
@@ -51,6 +57,11 @@ var (
 	ErrNoCredential  = errors.New("httpapi: a bearer token is required")
 	ErrWrongRole     = errors.New("httpapi: the token does not carry this role")
 	ErrNotAuthorised = errors.New("httpapi: the token is authentic and carries no applicable scope")
+
+	// ErrNoDeliveringWorkload refuses an intake mounted without the workload it admits: one that
+	// admitted any holder of the delivery scope would let a token minted for another workload
+	// write this projection.
+	ErrNoDeliveringWorkload = errors.New("httpapi: the delivery role admits one workload principal_id, and none is configured")
 )
 
 type callerKey struct{}
@@ -80,7 +91,12 @@ func CallerFrom(ctx context.Context) (Caller, bool) {
 // handler that forgets the check is indistinguishable from one that does not need it. Here
 // the role is chosen where the route is mounted, beside the security class, so both
 // properties of a route are stated in the same place.
-func Authenticate(verifier *verify.Verifier, role Role) (func(http.Handler) http.Handler, error) {
+//
+// deliveringWorkload is the principal_id of the one workload the delivery role admits:
+// organization-control's, which runs the dispatcher that delivers here (ADR-GLB-018 §5.4: "The
+// consumer's acceptance API admits that workload alone"). The delivery scope is not enough on its
+// own, because a scope is something a realm can grant to any client. The caller role takes none.
+func Authenticate(verifier *verify.Verifier, role Role, deliveringWorkload string) (func(http.Handler) http.Handler, error) {
 	if verifier == nil {
 		return nil, ErrNoVerifier
 	}
@@ -89,8 +105,17 @@ func Authenticate(verifier *verify.Verifier, role Role) (func(http.Handler) http
 	switch role {
 	case RoleDelivery:
 		required = DeliveryScope
+		if strings.TrimSpace(deliveringWorkload) == "" {
+			return nil, ErrNoDeliveringWorkload
+		}
+		if _, err := id.Parse(deliveringWorkload); err != nil {
+			return nil, fmt.Errorf("httpapi: the delivering workload %q is not a principal_id", deliveringWorkload)
+		}
 	case RoleCaller:
 		required = CallerScope
+		if deliveringWorkload != "" {
+			return nil, errors.New("httpapi: the caller role admits no delivering workload")
+		}
 	default:
 		return nil, fmt.Errorf("httpapi: unknown role %q", role)
 	}
@@ -122,12 +147,39 @@ func Authenticate(verifier *verify.Verifier, role Role) (func(http.Handler) http
 				return
 			}
 
+			if role == RoleDelivery {
+				if reason := deliveringWorkloadOnly(claims, deliveringWorkload); reason != "" {
+					// 403: the token is authentic and carries the scope, and it is not the
+					// producer's workload.
+					writeJSON(w, http.StatusForbidden, map[string]string{
+						"error": "this intake admits only the configured delivering workload: " + reason,
+					})
+					return
+				}
+			}
+
 			tenant, _ := claims.String(tenantClaim)
 			ctx := context.WithValue(r.Context(), callerKey{}, Caller{Subject: claims.Subject, Role: role,
 				Tenant: tenant, SelectsTenant: claims.Has(tenantClaim)})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}, nil
+}
+
+// deliveringWorkloadOnly says why a delivery token is not the configured workload's, or "" when it
+// is. The same three conditions identity-control's intake holds Organization Control's token to.
+func deliveringWorkloadOnly(claims verify.Claims, workload string) string {
+	principal, _ := claims.String(principalClaim)
+	subjectType, _ := claims.String(subjectTypeClaim)
+	switch {
+	case principal != workload:
+		return "the token names another principal_id"
+	case subjectType != "workload":
+		return "the token's subject_type is not workload"
+	case claims.Has(tenantClaim):
+		return "a delivery token carries no tenant_id"
+	}
+	return ""
 }
 
 func bearer(r *http.Request) (string, error) {

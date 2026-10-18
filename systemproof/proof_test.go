@@ -7,22 +7,22 @@ package systemproof
 // # The chain under test
 //
 //	organization-control  grants A and B, revokes A        (real API, real outbox)
-//	dispatcher            delivers through a proxy         (real dispatcher, real classification)
+//	organization-control  delivers through a proxy         (its in-process dispatcher, as its workload)
 //	proxy                 answers 422 to A's revocation    (the only non-production component)
 //	organization-control  dead-letters it as poison        (real decide(), real platform.dead_letter)
 //	frontier              reports SecurityDebt             (real HTTP, real cache on the consumer)
 //	consumer              refuses A and B for the debt     (real enforcement, read over HTTP)
 //	operator              replays A's revocation           (real replay, proxy now passing through)
 //	consumer              applies it, emits the receipt    (real projection, real header)
-//	dispatcher            records consumer_applied         (real receipt)
+//	organization-control  records consumer_applied         (real receipt)
 //	operator              resolves as REPLAYED             (real resolver, real resolution role)
 //	consumer              serves B, refuses A as withdrawn (after the frontier cache expires)
 //	organization-control  suspends and restores the Tenant (the consumer refuses, then serves B)
 //	proxy                 answers 503: the consumer is down (a revocation and a backlog queue)
-//	dispatcher            retries and releases, never dead-letters (an outage is not poison)
+//	organization-control  retries and releases, never dead-letters (an outage is not poison)
 //	consumer              receives the whole backlog on recovery (bounded by BackoffMax)
 //	proxy                 holds one delivery past the publish timeout (never forwarded)
-//	dispatcher            retries it, and it is applied exactly once (one receipt)
+//	organization-control  retries it, and it is applied exactly once (one receipt)
 //	organization-control  revokes 60 more, 20 of them through a failing first delivery
 //	observer              reports commit-to-applied p50/p95/p99/max for both paths (6 s budget)
 //
@@ -52,12 +52,26 @@ package systemproof
 //
 // (The component proof in internal/httpapi asserts the opposite -- A's reason does NOT change --
 // and both are right: there, A's revocation had already been applied before the debt existed.)
+//
+// # Who delivers
+//
+// organization-control, from its own process (ADR-GLB-018 §5.4). This repository shipped a
+// dispatcher of its own until 2026-10-15, with a static bearer token and a credential to the
+// producer's database; ADR-GLB-018 Alternative G, as amended, records its removal. The proof starts
+// organization-control with this consumer as a delivery target, behind the proxy, and the delivery
+// carries organization-control's workload token: obtained by clientauth from the dev issuer's client
+// credentials grant against a key this test generates, and admitted by the intake only because it
+// names REFERENCE_DELIVERY_PRINCIPAL_ID.
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -97,10 +111,17 @@ const (
 	consumerAddress = "127.0.0.1:18096"
 
 	// The consumer identity. It has to agree across three places that are configured
-	// independently: the registration with the producer, the consumer's own name, and the
-	// dispatcher's DISPATCH_CONSUMER_NAME. A disagreement between them is one of the failures this
-	// proof exists to catch, so all three are set from this one constant rather than typed.
+	// independently: the registration with the producer, the consumer's own name, and the name of
+	// organization-control's delivery target. A disagreement between them is one of the failures
+	// this proof exists to catch, so all three are set from this one constant rather than typed.
 	consumerName = "foundation-reference"
+
+	// organization-control's workload: the client its dispatcher authenticates as, and the
+	// principal_id the dev issuer's client credentials token names. The intake admits that
+	// principal_id alone (REFERENCE_DELIVERY_PRINCIPAL_ID), so the issuer and the consumer are both
+	// configured from these constants.
+	workloadClient     = "organization-control-workload"
+	deliveringWorkload = "55555555-5555-4555-8555-55555555550b"
 
 	// The consumer's workload Principal. organization-control recognizes a consumer token by its
 	// principal_id, registered with the consumer (organization-control ADR-ORG-001 §5.11), and its
@@ -129,9 +150,15 @@ const (
 	// because a generous slack is how a bounded-propagation assertion quietly becomes "eventually".
 	slack = 5 * time.Second
 
-	// The dispatcher's publish timeout, short so the timeout phase takes seconds rather than the
-	// default's minutes of retries.
+	// organization-control's delivery timeout (ORGANIZATION_DELIVERY_TIMEOUT), short so the
+	// timeout phase takes seconds rather than the default's minutes of retries.
 	publishTimeout = time.Second
+
+	// organization-control's poll period and idle ceiling (ORGANIZATION_DELIVERY_INTERVAL and
+	// _IDLE_INTERVAL). Inside TDD-organization-control-002's 1 s commit-to-claim budget, which
+	// phase nine measures against; foundation-platform's own 5 s idle default is not.
+	deliveryInterval     = 200 * time.Millisecond
+	deliveryIdleInterval = 300 * time.Millisecond
 
 	// foundation-platform's BackoffMax: the longest a released priority row waits before its next
 	// attempt, so the longest a recovered consumer waits for the backlog to resume.
@@ -170,12 +197,20 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	requirePortFree(t, producerAddress, "organization-control")
 	requirePortFree(t, consumerAddress, "foundation-reference")
 
-	start(t, env, "issuer", bins.issuer, nil)
+	keys := workloadKeys(t, env)
+	start(t, env, "issuer", bins.issuer, keys.issuerConfig())
 	waitHTTP(t, issuerURL+"/certs", 20*time.Second)
 
-	start(t, env, "organization-control", bins.producer, env.producerConfig())
+	// The proxy exists before organization-control, which is started with its address as the
+	// delivery target. It answers 503 until the consumer is up: deliveries owed before then are an
+	// outage, retried rather than dead-lettered, and drain once it passes through.
+	proxy := newPoisonProxy(t, "http://"+consumerAddress)
+	proxy.down.Store(true)
+
+	start(t, env, "organization-control", bins.producer, env.producerConfig(proxy.url()+"/v1/deliveries", keys))
 	waitHTTP(t, "http://"+producerAddress+"/readyz", 30*time.Second)
-	timeline.mark("organization-control ready")
+	timeline.mark("organization-control ready, delivering to %s through the proxy (down until the consumer is up)",
+		consumerName)
 
 	api := &client{t: t, http: &http.Client{Timeout: 15 * time.Second}}
 	provider := api.token("role=provider")
@@ -224,10 +259,10 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	start(t, env, "foundation-reference", bins.consumer, env.consumerConfig(consumerToken))
 	waitHTTP(t, "http://"+consumerAddress+"/readyz", 30*time.Second)
 
-	proxy := newPoisonProxy(t, "http://"+consumerAddress)
-	start(t, env, "dispatcher", bins.dispatcher, env.dispatcherConfig(proxy.url()+"/v1/deliveries",
-		api.token("role=delivery")))
-	timeline.mark("consumer bootstrapped; dispatcher delivering through the proxy (pass-through)")
+	proxy.down.Store(false)
+	held := proxy.unavailable.Swap(0)
+	timeline.mark("consumer bootstrapped; organization-control delivering through the proxy (pass-through; "+
+		"%d delivery(s) answered 503 while the consumer was down)", held)
 
 	producerDB := openProducer(t, env)
 
@@ -263,8 +298,7 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	}
 	// The dispatcher names the consumer that refused the event (foundation-platform v0.2.8), which
 	// is what lets organization-control attribute the debt to this consumer rather than to everyone
-	// and lets a retired consumer's incident be waived. Until this dispatcher moved past v0.2.6 it
-	// wrote nothing here, and only module tests had ever seen the column filled.
+	// and lets a retired consumer's incident be waived.
 	if letter.consumer != consumerName {
 		t.Fatalf("the dead letter names consumer %q, want %q: the running dispatcher does not attribute "+
 			"the incident, so every consumer carries it as debt", letter.consumer, consumerName)
@@ -975,8 +1009,8 @@ func git(t *testing.T, dir string, args ...string) string {
 // ---------------------------------------------------------------------------------------------
 
 type binaries struct {
-	producer, producerMigrate, issuer                string
-	consumer, consumerMigrate, bootstrap, dispatcher string
+	producer, producerMigrate, issuer    string
+	consumer, consumerMigrate, bootstrap string
 }
 
 func buildEverything(t *testing.T, env environment) binaries {
@@ -995,7 +1029,6 @@ func buildEverything(t *testing.T, env environment) binaries {
 		consumer:        exe("foundation-reference"),
 		consumerMigrate: exe("foundation-reference-migrate"),
 		bootstrap:       exe("foundation-reference-bootstrap"),
-		dispatcher:      exe("foundation-reference-dispatcher"),
 	}
 
 	build(t, env.producerSource, b.producer, "./cmd/organization-control")
@@ -1006,7 +1039,6 @@ func buildEverything(t *testing.T, env environment) binaries {
 	build(t, env.consumerSource, b.consumer, "./cmd/foundation-reference")
 	build(t, env.consumerSource, b.consumerMigrate, "./cmd/foundation-reference-migrate")
 	build(t, env.consumerSource, b.bootstrap, "./cmd/foundation-reference-bootstrap")
-	build(t, env.consumerSource, b.dispatcher, "./cmd/foundation-reference-dispatcher")
 	return b
 }
 
@@ -1122,7 +1154,9 @@ func (env environment) producerDSN(user, password string) string {
 	return withCredentials(withDatabase(env.adminDSN, producerDatabase), user, password)
 }
 
-func (env environment) producerConfig() map[string]string {
+// producerConfig is organization-control with this consumer as its one delivery target, at the
+// proxy's endpoint, delivering as its workload.
+func (env environment) producerConfig(deliveryEndpoint string, keys workload) map[string]string {
 	return map[string]string{
 		"ORGANIZATION_TENANT_DATABASE_URL":     env.producerDSN("organization_app", env.runtimePassword),
 		"ORGANIZATION_PROVIDER_DATABASE_URL":   env.producerDSN("organization_provider_app", env.providerPassword),
@@ -1136,6 +1170,63 @@ func (env environment) producerConfig() map[string]string {
 		// No claim or role names: the producer reads a caller from the standard's claims and its
 		// own records. Its provider is the dev issuer's, whose grant scripts/ci-fixture.sql seeds.
 		"ORGANIZATION_LISTEN_ADDRESS": producerAddress,
+
+		// Its in-process dispatcher (ADR-GLB-018 §5.4), on the dispatch role's own credential.
+		"ORGANIZATION_DELIVERY_TARGETS":       consumerName + "=" + deliveryEndpoint,
+		"ORGANIZATION_DISPATCH_DATABASE_URL":  env.producerDSN("organization_dispatch_app", env.dispatchPassword),
+		"ORGANIZATION_WORKLOAD_CLIENT_ID":     workloadClient,
+		"ORGANIZATION_WORKLOAD_KEY_FILE":      keys.privateFile,
+		"ORGANIZATION_WORKLOAD_TOKEN_URL":     issuerURL + "/token",
+		"ORGANIZATION_DELIVERY_TIMEOUT":       publishTimeout.String(),
+		"ORGANIZATION_DELIVERY_INTERVAL":      deliveryInterval.String(),
+		"ORGANIZATION_DELIVERY_IDLE_INTERVAL": deliveryIdleInterval.String(),
+		// The target is registered after organization-control starts, and its dispatcher waits for
+		// the registration, checking again at this interval rather than at the default minute.
+		"ORGANIZATION_DELIVERY_RETRY_INTERVAL": "500ms",
+	}
+}
+
+// workload is organization-control's workload key pair, generated per run: the private half for
+// organization-control's clientauth, the public half for the dev issuer that verifies its assertion.
+type workload struct {
+	privateFile, publicFile string
+}
+
+func workloadKeys(t *testing.T, env environment) workload {
+	t.Helper()
+	// 3072 bits: clientauth's floor, and the dev issuer's.
+	key, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatalf("generating the workload key: %v", err)
+	}
+	private, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("encoding the workload key: %v", err)
+	}
+	public, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("encoding the workload public key: %v", err)
+	}
+	out := workload{
+		privateFile: filepath.Join(env.binDir, "organization-control-workload.pem"),
+		publicFile:  filepath.Join(env.binDir, "organization-control-workload.pub.pem"),
+	}
+	if err := os.WriteFile(out.privateFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private}), 0o600); err != nil {
+		t.Fatalf("writing the workload key: %v", err)
+	}
+	if err := os.WriteFile(out.publicFile, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: public}), 0o600); err != nil {
+		t.Fatalf("writing the workload public key: %v", err)
+	}
+	return out
+}
+
+// issuerConfig registers organization-control's workload with the dev issuer, which then serves it
+// a token for this consumer by the client credentials grant.
+func (w workload) issuerConfig() map[string]string {
+	return map[string]string{
+		"ORGANIZATION_DEVISSUER_CLIENT_ID":              workloadClient,
+		"ORGANIZATION_DEVISSUER_CLIENT_PUBLIC_KEY_FILE": w.publicFile,
+		"ORGANIZATION_DEVISSUER_CLIENT_PRINCIPAL_ID":    deliveringWorkload,
 	}
 }
 
@@ -1151,18 +1242,8 @@ func (env environment) consumerConfig(authorityToken string) map[string]string {
 		"REFERENCE_TOKEN_ISSUER":       issuerURL,
 		"REFERENCE_JWKS_URL":           issuerURL + "/certs",
 		"REFERENCE_TOKEN_AUDIENCE":     "foundation-reference",
-	}
-}
-
-func (env environment) dispatcherConfig(endpoint, deliveryToken string) map[string]string {
-	return map[string]string{
-		"DISPATCH_OUTBOX_DATABASE_URL": env.producerDSN("organization_dispatch_app", env.dispatchPassword),
-		"DISPATCH_CONSUMER_ENDPOINT":   endpoint,
-		"DISPATCH_CONSUMER_NAME":       consumerName,
-		"DISPATCH_DELIVERY_TOKEN":      deliveryToken,
-		"DISPATCH_INTERVAL":            "200ms",
-		"DISPATCH_IDLE_INTERVAL":       "300ms",
-		"DISPATCH_PUBLISH_TIMEOUT":     publishTimeout.String(),
+		// The intake admits organization-control's workload and no other holder of the scope.
+		"REFERENCE_DELIVERY_PRINCIPAL_ID": deliveringWorkload,
 	}
 }
 
@@ -1307,8 +1388,8 @@ type poisonProxy struct {
 	down        atomic.Bool
 	unavailable atomic.Int64
 
-	// stall holds the delivery past the dispatcher's publish timeout and never forwards it: a
-	// timeout before the consumer could commit anything.
+	// stall holds the delivery past organization-control's delivery timeout and never forwards it:
+	// a timeout before the consumer could commit anything.
 	stall   atomic.Bool
 	stalled atomic.Int64
 

@@ -7,8 +7,9 @@
 // the configuration each side holds about the other, and whether a state change on one side
 // actually reaches a decision on the other. Component suites stay green while that seam is broken.
 //
-// So this runs the real system: organization-control built from an exact pinned revision, this
-// repository's consumer, dispatcher and bootstrap, a token issuer, and PostgreSQL. The only
+// So this runs the real system: organization-control built from an exact pinned revision, delivering
+// from its own process as its workload, this repository's consumer and bootstrap,
+// organization-control's dev token issuer, and PostgreSQL. The only
 // component that is not production code is a proxy in front of the consumer, and it exists because
 // the state under test cannot be produced any other way (see proof_test.go).
 //

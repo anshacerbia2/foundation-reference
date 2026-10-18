@@ -16,7 +16,7 @@ ADDR ?= 127.0.0.1:8096
 AUTHORITY ?= 127.0.0.1:8099
 
 .DEFAULT_GOAL := help
-.PHONY: help env migrate run deliver dispatch build fmt vet tidy test test-unit test-integration system-proof gates clean
+.PHONY: help env migrate run deliver build fmt vet tidy test test-unit test-integration system-proof gates clean
 
 help:
 	@echo Targets:
@@ -24,7 +24,9 @@ help:
 	@echo   make migrate           platform schema, then projection.membership
 	@echo   make run               the consumer on $(ADDR)
 	@echo   make deliver F=e.json  post one CloudEvents envelope to the intake
-	@echo   make dispatch          drain organization-control's outbox to this consumer
+	@echo   Deliveries come from organization-control's own process: run it with
+	@echo   ORGANIZATION_DELIVERY_TARGETS=foundation-reference=http://$(ADDR)/v1/deliveries
+	@echo   -- see README.md, "Deliveries come from organization-control"
 	@echo   make gates             fmt vet build tidy test
 	@echo   make test-integration  requires .env and a running PostgreSQL
 	@echo   make system-proof      Proof A across real processes; needs organization-control
@@ -56,18 +58,6 @@ deliver:
 	@if not exist $(F) (echo Not found: $(F) && exit 1)
 	@curl.exe -s -i -X POST -H "Content-Type: application/json" --data-binary "@$(F)" "http://$(ADDR)/v1/deliveries"
 
-# The dispatcher reads organization-control's database and posts here, so it needs that
-# service's DSN and this one running. It had no target at all until now, which meant the only
-# way to run it was to type six environment variables by hand.
-#
-# DISPATCH_CONSUMER_NAME must match REFERENCE_CONSUMER_NAME and the name registered with
-# organization-control. Nothing checks that -- the two sides are configured separately -- and a
-# mismatch produces delivery receipts nobody's resolution reads.
-dispatch:
-	@if not exist .env (echo No .env yet. Run: make env && exit 1)
-	@if "$(DISPATCH_DELIVERY_TOKEN)"=="" (echo No DISPATCH_DELIVERY_TOKEN. Mint one with the dev issuer -- it needs scope foundation-reference.deliver -- and put it in .env && exit 1)
-	go run ./cmd/foundation-reference-dispatcher
-
 build:
 	go build ./...
 
@@ -97,12 +87,13 @@ test-integration:
 	set REQUIRE_INTEGRATION=1&& go test ./internal/... -race -count=1
 
 # Proof A across the process boundary: organization-control built from the revision in
-# systemproof/organization-control.rev, this repository's consumer, dispatcher and bootstrap, and
-# a proxy that poisons exactly one delivery. See systemproof/proof_test.go.
+# systemproof/organization-control.rev and delivering from its own process, its dev issuer, this
+# repository's consumer and bootstrap, and a proxy that poisons exactly one delivery. See
+# systemproof/proof_test.go.
 #
 # It refuses a producer checkout that is not the pinned commit or has local changes, and a dirty
 # tree here unless SYSTEMPROOF_ALLOW_DIRTY=1 -- a green run has to be a statement about a system
-# somebody else can rebuild. Takes about a minute; most of it is building seven binaries.
+# somebody else can rebuild. Takes about a minute; most of it is building six binaries.
 system-proof:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
 	go test -tags systemproof ./systemproof -run TestProofAAcrossTheProcessBoundary -count=1 -v -timeout 10m
