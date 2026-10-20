@@ -30,6 +30,21 @@ make system-proof      Proof A across real processes (see below); needs .env and
 CI runs more than `make gates`: mutation gates that break a property and require its test to fail,
 and the `system-proof` job.
 
+**A projection made before 2026-10-20 must be rebuilt.** foundation-reference #30 added
+`projection.tenant.tenant_version`, `bigint NOT NULL`, so that a Tenant is ordered by the pair
+(ADR-ORG-003 §5.5). `make migrate` only creates tables that are missing (`CREATE TABLE IF NOT
+EXISTS`), so it leaves an older `projection.tenant` without the column, and every Tenant write then
+fails. Rebuild the projection, then seed it again:
+
+```text
+go run ./cmd/foundation-reference-migrate -rebuild    drops projection.membership, .tenant and .watermark, then creates them
+go run ./cmd/foundation-reference-bootstrap           a snapshot from organization-control, then catch-up
+```
+
+Until the bootstrap has run, every projection-backed operation is refused, which is correct: the
+consumer holds no positive authority. The system proof builds its databases from zero on every run,
+so it needs nothing.
+
 **Deliveries come from organization-control.** To feed a consumer running here, run
 `organization-control` (`make issuer`, then `make run`, in that repository) with this consumer as a
 delivery target. Its `.env.example` has the block to uncomment:
@@ -151,6 +166,12 @@ with an external system to bring the current state closer in line" ([Controllers
   nothing. A `401`, `403` or `404` is logged at `WARN`. A run with findings is logged at `WARN`, and one
   with an `extra` finding at `ERROR`. organization-control alerts on the age, so a consumer that keeps
   failing is reported there.
+- **The scheduler is off without `REFERENCE_AUTHORITY_BASE_URL`.** It needs the authority it
+  compares with. With the variable empty, startup logs at `WARN` "no authority configured; this
+  consumer never reconciles itself with organization-control", and no run is ever sent. The same
+  setting also leaves `PRIVILEGED` and `IRREVERSIBLE` without an authority and every
+  projection-backed class without the publication frontier, so all of them refuse. organization-control's
+  overdue alerts then fire for this consumer, past one and two declared intervals.
 
 [k8s-controller]: https://kubernetes.io/docs/concepts/architecture/controller/
 [prom-batch]: https://prometheus.io/docs/practices/instrumentation/#batch-jobs
@@ -230,6 +251,17 @@ Tenant authority types, and the reconciliation repair. A type outside the subscr
 delivered, so it cannot park as poison here. Changing the types clears the consumer's snapshot mark,
 and it bootstraps again. The registration also declares `reconciliation_interval_seconds`, from 60 to
 604800, which the consumer's reconciliation runs on. Absent, organization-control records one day.
+
+**Which interval this consumer runs on.** It does not register itself. A provider registers it in
+organization-control (`POST /v1/projections/consumers`), and the interval is whatever that
+registration declares:
+
+- the system proof declares one week, so that no scheduled run lands inside phases 1 to 9, then
+  re-registers with one minute in phase 10;
+- any other registration that sends no `reconciliation_interval_seconds` relies on
+  organization-control's default, one day (86400 seconds).
+
+No copy of the interval is kept here, so changing it is a change to the registration alone.
 
 **Three names must agree.** This consumer's name in organization-control's
 `ORGANIZATION_DELIVERY_TARGETS`, `REFERENCE_CONSUMER_NAME`, and the consumer_id registered with
