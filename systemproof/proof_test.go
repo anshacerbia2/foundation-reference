@@ -166,6 +166,15 @@ const (
 
 	// The backlog built while the consumer is down, beside the revocation.
 	backlogSize = 5
+
+	// The consumer reconciles itself on the interval its registration declares (ADR-ORG-001 §5.7),
+	// reading the registration every reconcileCheck. It registers at the week organization-control
+	// allows at most, so after its first run at startup no run lands inside phases one to nine: a
+	// repair applying a revocation there would race the assertions about how that revocation arrives.
+	// Phase ten declares the minute organization-control allows at least, and waits for the run.
+	reconcileCheck   = 2 * time.Second
+	quietInterval    = 7 * 24 * time.Hour
+	declaredInterval = time.Minute
 )
 
 // frontierTTL is the consumer's frontier cache interval, computed the way cmd/foundation-reference
@@ -226,7 +235,8 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 			"stale_behavior":           "fail_closed",
 			// The registration is the subscription (ADR-GLB-018 §5.1): the producer owes this
 			// consumer a delivery of exactly the types it applies.
-			"event_types": projection.AppliedEventTypes(),
+			"event_types":                     projection.AppliedEventTypes(),
+			"reconciliation_interval_seconds": int(quietInterval / time.Second),
 		})
 
 	// The Tenant's administrator. A token's tenant_id selects a Tenant and confers nothing
@@ -263,6 +273,19 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 	held := proxy.unavailable.Swap(0)
 	timeline.mark("consumer bootstrapped; organization-control delivering through the proxy (pass-through; "+
 		"%d delivery(s) answered 503 while the consumer was down)", held)
+
+	// The consumer reconciles itself at once, since none is recorded, as itself and not as a provider.
+	// It has just bootstrapped, so its copy agrees with authority.
+	first := waitRegistration(t, api, provider, reconcileCheck+slack,
+		"the consumer's first reconciliation to be recorded", func(r map[string]any) bool {
+			return r["last_reconciled_at"] != nil
+		})
+	if findings := first["last_reconciled_findings"]; findings != float64(0) {
+		t.Fatalf("the consumer's first reconciliation, right after its bootstrap, found %v difference(s): %v",
+			findings, first)
+	}
+	timeline.mark("the consumer reconciled itself at startup: declared interval %vs, 0 findings",
+		first["reconciliation_interval_seconds"])
 
 	producerDB := openProducer(t, env)
 
@@ -550,21 +573,103 @@ func TestProofAAcrossTheProcessBoundary(t *testing.T) {
 		"the invented Membership to be served, which is the drift", allowed)
 	timeline.mark("drift: %s's row lost (refused); an invented Membership served (%s)", lost.principal, escalated)
 
-	report := consumerReport(t, consumerDB)
-	sweep := api.expect(http.StatusOK, http.MethodPost, producerURL("/v1/projections/reconcile"), provider, report)
-	classes := findingClasses(sweep)
-	if classes[lost.membership] != "missing" || classes[inventedMembership] != "extra" {
-		t.Fatalf("the sweep classified the lost row %q and the invented one %q, want missing and extra: %v",
-			classes[lost.membership], classes[inventedMembership], sweep)
+	// The repair is the consumer's own run (ADR-ORG-001 §5.7). A restore bump asks every consumer to
+	// reconcile by setting reconciliation_requested_at, and the bump runs before the service serves, so
+	// the proof sets the column the way the bump does; the consumer sees the request at its next check.
+	before := registration(t, api, provider)
+	producerExec(t, producerDB, `UPDATE projection.consumer SET reconciliation_requested_at = now()
+	    WHERE consumer_id = $1`, consumerName)
+	requestedAt := time.Now()
+	swept := waitRegistration(t, api, provider, reconcileCheck+slack,
+		"the consumer to reconcile itself on the restore's request", func(r map[string]any) bool {
+			return r["last_reconciled_at"] != before["last_reconciled_at"] && r["reconciliation_requested_at"] == nil
+		})
+	if swept["last_reconciled_findings"] != float64(2) || swept["last_reconciled_extra_findings"] != float64(1) {
+		t.Fatalf("the consumer's run recorded %v finding(s), %v extra, want the lost row missing and the invented "+
+			"one extra: %v", swept["last_reconciled_findings"], swept["last_reconciled_extra_findings"], swept)
 	}
 	sweptAt := time.Now()
-	timeline.mark("reconciled: %d finding(s), the lost row missing, the invented one extra", len(classes))
+	timeline.mark("the consumer reconciled itself %s after the request: 2 findings, 1 extra; the request cleared",
+		sweptAt.Sub(requestedAt).Round(time.Millisecond))
 
 	restored := waitDecision(t, api, lost, recovery, "the lost Membership to be repaired", allowed)
 	removed := waitDecision(t, api, invented, recovery, "the invented Membership to be removed",
 		func(d decision) bool { return !d.Allowed })
-	timeline.mark("repaired %s after the sweep: lost row %s; invented %s",
+	timeline.mark("repaired %s after the run: lost row %s; invented %s",
 		time.Since(sweptAt).Round(time.Millisecond), restored, removed)
+
+	// The declared interval. Declared a minute, the next run comes within a minute of the last one and
+	// not at every check, and it finds nothing: the copy was repaired.
+	api.expect(http.StatusCreated, http.MethodPost, producerURL("/v1/projections/consumers"), provider,
+		map[string]any{
+			"consumer_id":                     consumerName,
+			"principal_id":                    consumerPrincipal,
+			"projection_version":              "v1",
+			"max_accepted_age_seconds":        int(maxProjectionAge / time.Second),
+			"stale_behavior":                  "fail_closed",
+			"event_types":                     projection.AppliedEventTypes(),
+			"reconciliation_interval_seconds": int(declaredInterval / time.Second),
+		})
+	timeline.mark("re-registered with a declared reconciliation interval of %s", declaredInterval)
+	next := waitRegistration(t, api, provider, declaredInterval+reconcileCheck+slack,
+		"the consumer's next run on its declared interval", func(r map[string]any) bool {
+			return r["last_reconciled_at"] != swept["last_reconciled_at"]
+		})
+	gap := timestamp(t, next["last_reconciled_at"]).Sub(timestamp(t, swept["last_reconciled_at"]))
+	if gap < declaredInterval-reconcileCheck-time.Second || gap > declaredInterval+reconcileCheck+slack {
+		t.Fatalf("the consumer ran %s after its last run, want its declared %s, to within one check", gap,
+			declaredInterval)
+	}
+	if next["last_reconciled_findings"] != float64(0) {
+		t.Fatalf("the run after the repair found %v difference(s): %v", next["last_reconciled_findings"], next)
+	}
+	timeline.mark("the consumer ran again %s after its last run (declared %s): 0 findings",
+		gap.Round(time.Millisecond), declaredInterval)
+}
+
+// registration reads the consumer's registration as organization-control holds it, with the record of
+// its last reconciliation.
+func registration(t *testing.T, api *client, provider string) map[string]any {
+	t.Helper()
+	return api.expect(http.StatusOK, http.MethodGet, producerURL("/v1/projections/consumers/"+consumerName),
+		provider, nil)
+}
+
+func waitRegistration(t *testing.T, api *client, provider string, within time.Duration, what string,
+	want func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		current := registration(t, api, provider)
+		if want(current) {
+			return current
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s; the registration reads %v", within, what, current)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func timestamp(t *testing.T, raw any) time.Time {
+	t.Helper()
+	text, _ := raw.(string)
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		t.Fatalf("%v is not a timestamp: %v", raw, err)
+	}
+	return parsed
+}
+
+// producerExec changes the producer's database directly, for a step only a restore makes.
+func producerExec(t *testing.T, producer *fdb.Pool, statement string, args ...any) {
+	t.Helper()
+	if err := producer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
+		_, err := tx.Exec(ctx, statement, args...)
+		return err
+	}); err != nil {
+		t.Fatalf("changing the producer's database: %v", err)
+	}
 }
 
 func newIdentifier(t *testing.T) string {
@@ -585,50 +690,6 @@ func consumerExec(t *testing.T, consumer *fdb.Pool, statement string, args ...an
 	}); err != nil {
 		t.Fatalf("changing the consumer's projection: %v", err)
 	}
-}
-
-// consumerReport is the consumer's account of its active projection at its applied mark, in the
-// reconcile route's shape.
-func consumerReport(t *testing.T, consumer *fdb.Pool) map[string]any {
-	t.Helper()
-	var mark int64
-	var rows []map[string]any
-	if err := consumer.InTx(context.Background(), func(ctx context.Context, tx fdb.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT applied_mark FROM projection.watermark WHERE consumer = $1`,
-			consumerName).Scan(&mark); err != nil {
-			return err
-		}
-		result, err := tx.Query(ctx, `SELECT membership_id::text, membership_version FROM projection.membership
-		    WHERE membership_status = 'active' ORDER BY membership_id`)
-		if err != nil {
-			return err
-		}
-		defer result.Close()
-		for result.Next() {
-			var membership string
-			var version int64
-			if err := result.Scan(&membership, &version); err != nil {
-				return err
-			}
-			rows = append(rows, map[string]any{"membership_id": membership, "membership_version": version})
-		}
-		return result.Err()
-	}); err != nil {
-		t.Fatalf("reading the consumer's projection for its report: %v", err)
-	}
-	return map[string]any{"consumer_id": consumerName, "mark": mark, "rows": rows}
-}
-
-func findingClasses(sweep map[string]any) map[string]string {
-	out := map[string]string{}
-	findings, _ := sweep["findings"].([]any)
-	for _, raw := range findings {
-		f, _ := raw.(map[string]any)
-		membership, _ := f["membership_id"].(string)
-		class, _ := f["classification"].(string)
-		out[membership] = class
-	}
-	return out
 }
 
 const (
@@ -1244,6 +1305,8 @@ func (env environment) consumerConfig(authorityToken string) map[string]string {
 		"REFERENCE_TOKEN_AUDIENCE":     "foundation-reference",
 		// The intake admits organization-control's workload and no other holder of the scope.
 		"REFERENCE_DELIVERY_PRINCIPAL_ID": deliveringWorkload,
+		// How often it reads its registration to see whether a reconciliation is due.
+		"REFERENCE_RECONCILE_CHECK_INTERVAL": reconcileCheck.String(),
 	}
 }
 

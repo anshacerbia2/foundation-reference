@@ -11,7 +11,7 @@ module github.com/anshacerbia2/foundation-reference
 go 1.26.0
 
 require (
-	github.com/anshacerbia2/foundation-platform v0.3.1
+	github.com/anshacerbia2/foundation-platform v0.5.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0

@@ -122,17 +122,72 @@ A `missing` or `mismatch` finding without a state is what a producer from before
 The sweep is refused as poison rather than read as a removal, which would delete a Membership
 authority holds.
 
+**The consumer reconciles itself, on the interval it declares** (ADR-ORG-001 §5.7, amended
+2026-10-20; organization-control TDD-002 1.16.0 §Reconciliation Interval). The owner chose that the
+party holding the copy runs the comparison. Kubernetes describes the same split: "Controllers that
+interact with external state find their desired state from the API server, then communicate directly
+with an external system to bring the current state closer in line" ([Controllers][k8s-controller]).
+`internal/reconcile` does it from inside the serving process:
+
+- **The interval is the registration's.** Every `REFERENCE_RECONCILE_CHECK_INTERVAL` (default `1m`,
+  at most `1m`) the consumer reads its own registration, `GET /v1/projections/consumers/{consumer_id}`.
+  That gives the declared `reconciliation_interval_seconds`, the age of the last recorded run, and
+  `reconciliation_requested_at`. No second copy of the interval sits in configuration.
+- **A run is due** when none is recorded, when a restore asked for one, or when the age plus one check
+  reaches the declared interval. So the run lands before organization-control's
+  `ReconciliationOverdueWarning`, which fires past one interval.
+- **A run sends the report as this consumer.** `projection.Report` holds every active Membership and
+  the mark they correspond to: the higher of the snapshot mark and the highest applied position, read
+  in one statement. It goes to `POST /v1/projections/reconcile` with the consumer's own token
+  (`REFERENCE_AUTHORITY_TOKEN`). That route admits a registered consumer for its own `consumer_id`
+  from organization-control 1.16.0. The repair arrives as `projection.repair.reconciled`, above.
+- **The schedule follows the recorded run, not a timer.** Prometheus: "The key metric of a batch job
+  is the last time it succeeded" ([Instrumentation][prom-batch]). A restart, a second replica or a
+  failed run cannot stretch the gap past the declared interval, because whoever checks next sees the
+  age. Two replicas that check in the same instant both run, which is harmless: a reconciliation is
+  idempotent against a consistent state. The age is computed on organization-control's clock, so no
+  two clocks are subtracted.
+- **Failures are logged and retried at the next check.** A consumer that has not bootstrapped sends
+  nothing. A `401`, `403` or `404` is logged at `WARN`. A run with findings is logged at `WARN`, and one
+  with an `extra` finding at `ERROR`. organization-control alerts on the age, so a consumer that keeps
+  failing is reported there.
+
+[k8s-controller]: https://kubernetes.io/docs/concepts/architecture/controller/
+[prom-batch]: https://prometheus.io/docs/practices/instrumentation/#batch-jobs
+
 Before the list existed, every type other than Membership was refused. The dispatcher delivers
 everything the producer publishes, so every Workspace change, invitation and Tenant suspension
 dead-lettered, and none of those incidents could ever be closed.
 
 **Tenant state is enforced.** The authority refuses every member of a Tenant that is not active,
-and so does this consumer. `projection.tenant` holds each Tenant's status and is ordered by
-`tenant_security_version`. A member of a Tenant that is suspended, offboarding or retired is
+and so does this consumer. `projection.tenant` holds each Tenant's status and is ordered by the pair
+(`tenant_security_version`, `tenant_version`). A member of a Tenant that is suspended, offboarding or retired is
 refused, whatever their Membership says. So is an active member whose Tenant state has not arrived
 yet: absence is no positive authority, for a Tenant as for a Membership. The snapshot seeds each
 Tenant's state beside its members. It used to write a suspension onto the membership rows instead,
 where the Tenant's restoration, an event about the Tenant, could never lift it.
+
+**Why the pair.** The security version moves on every transition that changes whether the Tenant's
+contexts are valid. Activation is not one of them, so an activation carries the same security version
+as the provisioning state before it. Ordered by the security version alone, a snapshot that seeded the
+provisioning Tenant discarded the activation that followed, and every member stayed refused.
+organization-control's TDD-002 §Published Events says it: "A transition that does not increment the
+security version publishes the same value twice, so it cannot order them." `tenant_version` moves on
+every transition and breaks the tie. identity-control orders its Tenants by the same pair (its #114).
+PostgreSQL compares the two as a row: "the row elements are compared left-to-right, stopping as soon as
+an unequal or null pair of elements is found" ([Row Constructor Comparison][pg-row]). A CI mutation that
+goes back to the security version alone must turn
+`TestAnActivationWithTheSameSecurityVersionIsOrderedByTenantVersion` red.
+
+**A restore's 10^9 bump is applied** (ADR-ORG-003 §5.5). A restore to an older point moves every
+Tenant's `tenant_version` and `tenant_security_version` by 10^9 before organization-control serves. It
+republishes each withdrawn Tenant at its new versions. This consumer applies any higher pair and checks
+no gap, so the jump is applied like any later version. Every version column is a `bigint`.
+`TestARestoreBumpOfTenToTheNinthIsApplied` proves the jump, the next transition after it, and a late
+pre-restore event discarded. Memberships are not bumped: organization-control advances each one past
+the version this consumer reports (`POST /v1/projections/advance-versions`).
+
+[pg-row]: https://www.postgresql.org/docs/17/functions-comparisons.html#ROW-WISE-COMPARISON
 
 The superseded row is why a dead letter that a newer version has overtaken can never resolve as
 `REPLAYED`. `organization-control` closes it as `SUPERSEDED` instead, on the `consumer_applied`
@@ -173,7 +228,8 @@ a CI mutation that admits any workload must turn `TestOnlyTheConfiguredWorkloadM
 delivers exactly those types. They are `projection.AppliedEventTypes()`: the four Membership and four
 Tenant authority types, and the reconciliation repair. A type outside the subscription is never
 delivered, so it cannot park as poison here. Changing the types clears the consumer's snapshot mark,
-and it bootstraps again.
+and it bootstraps again. The registration also declares `reconciliation_interval_seconds`, from 60 to
+604800, which the consumer's reconciliation runs on. Absent, organization-control records one day.
 
 **Three names must agree.** This consumer's name in organization-control's
 `ORGANIZATION_DELIVERY_TARGETS`, `REFERENCE_CONSUMER_NAME`, and the consumer_id registered with
@@ -242,11 +298,16 @@ across real processes:
    fails if either maximum exceeds the 6 s that TDD-organization-control-002 §Enforcement Budget
    gives commit-to-claim plus dispatch-to-applied. Accept to commit happens inside one request and
    is not part of this number.
-10. **The projection drifts, and reconciliation repairs it.** The proof deletes a served
-    principal's row from the consumer's database, and inserts an active Membership that authority
-    never granted. The first principal is refused and the invented one is served: the drift.
-    The consumer's report goes to `POST /v1/projections/reconcile`, which must classify the two
-    as `missing` and `extra`. Its repair must then restore the first and remove the second.
+10. **The projection drifts, and the consumer's own reconciliation repairs it.** The consumer
+    registers with a declared interval of one week, so after its first run no run lands inside
+    phases 1 to 9. That first run happens at startup, because none is recorded, and must find
+    nothing. Then the proof deletes a served principal's row from the consumer's database, and
+    inserts an active Membership that authority never granted. The first principal is refused and
+    the invented one is served: the drift. The proof sets `reconciliation_requested_at`, as a restore
+    bump does. Within one check the consumer must reconcile itself, as itself, and organization-control
+    must record 2 findings, 1 `extra`, and clear the request. The repair must then restore the first
+    principal and remove the second. Last, the consumer re-registers with a declared interval of one
+    minute. Its next run must come one minute after the last, to within one check, and find nothing.
 
 Phases 7 and 8 were observed once by hand during Proof A (RESPONSE-7 to RESPONSE-10), and phase
 9 replaces Proof A's single 32 ms sample. All three run on every build from here.

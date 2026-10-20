@@ -160,6 +160,7 @@ func TestResolvingTheDebtRestoresTheBystanderAndLeavesTheRevocationEnforced(t *t
 		TenantStatus: "active",
 
 		TenantSecurityVersion: 1,
+		TenantVersion:         1,
 	}}, 1000, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -273,7 +274,7 @@ func TestResolvingTheDebtRestoresTheBystanderAndLeavesTheRevocationEnforced(t *t
 func activeTenant(t *testing.T, projector *projection.Projector, ctx context.Context, tenant id.UUID, position int64) {
 	t.Helper()
 	envelope, err := event.New(producer, projection.TenantActivated, time.Now().UTC(), projection.TenantPayload{
-		TenantID: tenant, TenantStatus: "active", TenantSecurityVersion: 1,
+		TenantID: tenant, TenantStatus: "active", TenantSecurityVersion: 1, TenantVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("building a tenant envelope: %v", err)

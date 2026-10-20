@@ -51,9 +51,9 @@ func TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot(t *testing.T) {
 	// Page 1, taken at mark 1000: the state as of then.
 	if err := projector.Seed(ctx, []projection.Seeded{
 		{MembershipID: stable.membership, TenantID: stable.tenant, PrincipalID: stable.principal,
-			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1, TenantVersion: 1},
 		{MembershipID: moved.membership, TenantID: moved.tenant, PrincipalID: moved.principal,
-			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1, TenantVersion: 1},
 	}, mark, false); err != nil {
 		t.Fatalf("seeding page 1: %v", err)
 	}
@@ -66,9 +66,9 @@ func TestTheConsumerConvergesWhenTheAuthorityChangesMidSnapshot(t *testing.T) {
 	// not exist at mark 1000 and appears here anyway.
 	if err := projector.Seed(ctx, []projection.Seeded{
 		{MembershipID: replaced.membership, TenantID: replaced.tenant, PrincipalID: replaced.principal,
-			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1, TenantVersion: 1},
 		{MembershipID: replacement.membership, TenantID: replacement.tenant, PrincipalID: replacement.principal,
-			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1},
+			Status: projection.Active, Version: 1, TenantStatus: "active", TenantSecurityVersion: 1, TenantVersion: 1},
 	}, mark, true); err != nil {
 		t.Fatalf("seeding page 2: %v", err)
 	}
@@ -163,6 +163,7 @@ func TestCatchUpDoesNotRegressStateThePagesAlreadyCarried(t *testing.T) {
 		TenantStatus: "active",
 
 		TenantSecurityVersion: 1,
+		TenantVersion:         1,
 	}}, mark, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}

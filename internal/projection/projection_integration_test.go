@@ -301,6 +301,7 @@ func TestAgeRefusesUntilTheConsumerHasBootstrapped(t *testing.T) {
 		TenantStatus: "active",
 
 		TenantSecurityVersion: 1,
+		TenantVersion:         1,
 	}}, 1000, true); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
