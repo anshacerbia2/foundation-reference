@@ -251,6 +251,28 @@ jobs:
           echo "the guard is load-bearing: removing it fails the ordering and convergence tests"
           mv "$file.orig" "$file"
 
+      # A Tenant is ordered by (tenant_security_version, tenant_version). The security version alone
+      # leaves a tie on activation, which moves only tenant_version, and discarded the activation that
+      # followed a snapshot of the provisioning Tenant (identity-control fixed the same in its #114).
+      # Restoring the security-version-only guard must turn the activation test red.
+      - name: the Tenant ordering breaks the security version's tie
+        run: |
+          file=internal/projection/projection.go
+          cp "$file" "$file.orig"
+          sed -i -E 's/ WHERE \(excluded\.tenant_security_version, excluded\.tenant_version\) > \(tenant\.tenant_security_version, tenant\.tenant_version\)/ WHERE excluded.tenant_security_version > tenant.tenant_security_version/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the Tenant ordering guard was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./internal/projection -count=1 -run 'TestAnActivationWithTheSameSecurityVersionIsOrderedByTenantVersion'; then
+            echo "::error::the suite passed with the Tenant ordered by its security version alone, so it does not test the tie"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the tie-break is load-bearing: ordering by the security version alone fails the activation test"
+          mv "$file.orig" "$file"
+
       # The application receipt asserts one thing: this consumer applied THIS event. Two
       # mutations, because that assertion can be made false in two different directions.
       #

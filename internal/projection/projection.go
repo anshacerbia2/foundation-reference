@@ -227,6 +227,11 @@ type TenantPayload struct {
 	TenantID              id.UUID `json:"tenant_id"`
 	TenantStatus          string  `json:"tenant_status"`
 	TenantSecurityVersion int64   `json:"tenant_security_version"`
+
+	// TenantVersion increments on every transition of the Tenant, including the ones that leave the
+	// security version where it was, activation among them. It breaks the tie the security version
+	// leaves (see upsertTenantStatement).
+	TenantVersion int64 `json:"tenant_version"`
 }
 
 // Position is what this consumer knows about its own place in the producer's stream.
@@ -381,19 +386,32 @@ func (p *Projector) Apply(ctx context.Context, envelope event.Envelope) (Outcome
 	return outcome, nil
 }
 
-// The ordering rule for a Tenant: its security version, which the authority increments under a row
-// lock on every transition that changes whether the Tenant's contexts are valid. An event carrying a
-// version no higher than the one held is older, or a duplicate, and changes nothing.
+// The ordering rule for a Tenant: (tenant_security_version, tenant_version), compared as a row. PostgreSQL
+// compares row constructors "left-to-right, stopping as soon as an unequal or null pair of elements is
+// found" (PostgreSQL 17 §9.25.5), so the security version decides and tenant_version breaks its tie.
+//
+// The security version alone left a tie. The authority increments it on every transition that changes
+// whether the Tenant's contexts are valid, and not on activation, so an activation carries the same
+// security version as the provisioning state before it: a snapshot that seeded the provisioning Tenant
+// discarded the activation that followed, and every member stayed refused. tenant_version increments on
+// every transition and orders them (TDD-organization-control-002 §Published Events). identity-control
+// orders its Tenant desired state by the same pair (its #114).
+//
+// A restore to an older point moves both by 10^9 before the authority serves (ADR-ORG-003 §5.5), so the
+// withdrawals it republishes are newer than any state held here, and a late event from before the
+// restore is discarded. An event no newer than the state held is older, or a duplicate, and changes
+// nothing.
 const upsertTenantStatement = `INSERT INTO projection.tenant
-    (tenant_id, tenant_status, tenant_security_version, applied_mark, applied_at, event_id)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, tenant_status, tenant_security_version, tenant_version, applied_mark, applied_at, event_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (tenant_id) DO UPDATE
    SET tenant_status           = excluded.tenant_status,
        tenant_security_version = excluded.tenant_security_version,
+       tenant_version          = excluded.tenant_version,
        applied_mark            = excluded.applied_mark,
        applied_at              = excluded.applied_at,
        event_id                = excluded.event_id
- WHERE excluded.tenant_security_version > tenant.tenant_security_version`
+ WHERE (excluded.tenant_security_version, excluded.tenant_version) > (tenant.tenant_security_version, tenant.tenant_version)`
 
 // applyTenant projects one Tenant event, under the same inbox guard and in the same transaction as
 // the watermark, as a Membership event is.
@@ -405,9 +423,10 @@ func (p *Projector) applyTenant(ctx context.Context, envelope event.Envelope) (O
 	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
 		return Outcome{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
-	if payload.TenantID.IsNil() || payload.TenantStatus == "" || payload.TenantSecurityVersion <= 0 {
-		return Outcome{}, fmt.Errorf("%w: tenant_id, tenant_status and a positive tenant_security_version are required",
-			ErrMalformed)
+	if payload.TenantID.IsNil() || payload.TenantStatus == "" || payload.TenantSecurityVersion <= 0 ||
+		payload.TenantVersion <= 0 {
+		return Outcome{}, fmt.Errorf("%w: tenant_id, tenant_status and a positive tenant_security_version and "+
+			"tenant_version are required", ErrMalformed)
 	}
 
 	var outcome Outcome
@@ -422,7 +441,8 @@ func (p *Projector) applyTenant(ctx context.Context, envelope event.Envelope) (O
 		}
 		appliedAt := p.now().UTC()
 		tag, err := tx.Exec(ctx, upsertTenantStatement, payload.TenantID.String(), payload.TenantStatus,
-			payload.TenantSecurityVersion, envelope.StreamPosition, appliedAt, envelope.ID.String())
+			payload.TenantSecurityVersion, payload.TenantVersion, envelope.StreamPosition, appliedAt,
+			envelope.ID.String())
 		if err != nil {
 			return fmt.Errorf("projection: applying %s: %w", envelope.ID, err)
 		}
@@ -623,6 +643,10 @@ type Seeded struct {
 	// TenantStatus is the Tenant's status at the snapshot's mark, seeded into projection.tenant under
 	// the same ordering rule as a Tenant event. The membership keeps its own status.
 	TenantStatus string
+
+	// TenantVersion orders the seeded Tenant state against a Tenant event, beside its security
+	// version. Snapshot rows carry it from organization-control 1.8.0.
+	TenantVersion int64
 }
 
 func (s Seeded) workspace() any {
@@ -659,11 +683,11 @@ func (p *Projector) Seed(ctx context.Context, rows []Seeded, mark int64, final b
 			}
 			// Every row carries its Tenant's state, so a Tenant appears once per member; the ordering
 			// rule makes the repeats no-ops, and an event newer than the snapshot is never overwritten.
-			if row.TenantStatus == "" || row.TenantSecurityVersion <= 0 {
+			if row.TenantStatus == "" || row.TenantSecurityVersion <= 0 || row.TenantVersion <= 0 {
 				return fmt.Errorf("%w: a snapshot row for %s carries no tenant state", ErrMalformed, row.MembershipID)
 			}
 			if _, err := tx.Exec(ctx, upsertTenantStatement, row.TenantID.String(), row.TenantStatus,
-				row.TenantSecurityVersion, mark, at, nil); err != nil {
+				row.TenantSecurityVersion, row.TenantVersion, mark, at, nil); err != nil {
 				return fmt.Errorf("projection: seeding tenant %s: %w", row.TenantID, err)
 			}
 		}

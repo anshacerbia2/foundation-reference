@@ -28,6 +28,7 @@ import (
 	"github.com/anshacerbia2/foundation-reference/internal/frontier"
 	"github.com/anshacerbia2/foundation-reference/internal/httpapi"
 	"github.com/anshacerbia2/foundation-reference/internal/projection"
+	"github.com/anshacerbia2/foundation-reference/internal/reconcile"
 	enforcement "github.com/anshacerbia2/foundation-reference/internal/telemetry"
 )
 
@@ -123,6 +124,22 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			slog.String("variable", "REFERENCE_AUTHORITY_BASE_URL"))
 	}
 
+	// The consumer reconciles itself on the interval its registration declares (ADR-ORG-001 §5.7). It
+	// needs the authority it compares with, so it runs whenever one is configured.
+	var reconciliation *reconcile.Scheduler
+	if cfg.AuthorityBaseURL != "" {
+		producer, err := reconcile.NewClient(cfg.AuthorityBaseURL, cfg.AuthorityToken, cfg.ConsumerName,
+			cfg.AuthorityTimeout)
+		if err != nil {
+			return fmt.Errorf("reconciliation client: %w", err)
+		}
+		reconciliation = &reconcile.Scheduler{Reporter: projector, Producer: producer,
+			Check: cfg.ReconcileCheck, Logger: logger}
+	} else {
+		logger.Warn("no authority configured; this consumer never reconciles itself with organization-control",
+			slog.String("variable", "REFERENCE_AUTHORITY_BASE_URL"))
+	}
+
 	enforcer, err := httpapi.NewEnforcer(projector, authority, publication, cfg.MaxProjectionAge)
 	if err != nil {
 		return fmt.Errorf("enforcer: %w", err)
@@ -214,6 +231,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		slog.String("consumer", cfg.ConsumerName),
 		slog.String("delivering_workload", cfg.DeliveryPrincipal),
 		slog.Duration("max_projection_age", cfg.MaxProjectionAge))
+
+	if reconciliation != nil {
+		go reconciliation.Run(ctx)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() {

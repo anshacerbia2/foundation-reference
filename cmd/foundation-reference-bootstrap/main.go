@@ -51,6 +51,7 @@ type snapshotRow struct {
 	MembershipVersion int64  `json:"membership_version"`
 
 	TenantStatus          string `json:"tenant_status"`
+	TenantVersion         int64  `json:"tenant_version"`
 	TenantSecurityVersion int64  `json:"tenant_security_version"`
 }
 
@@ -146,6 +147,7 @@ func run(logger *slog.Logger) error {
 				Version:               row.MembershipVersion,
 				TenantSecurityVersion: row.TenantSecurityVersion,
 				TenantStatus:          row.TenantStatus,
+				TenantVersion:         row.TenantVersion,
 			})
 		}
 

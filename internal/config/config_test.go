@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // required sets every variable without a default, after clearing the ambient REFERENCE_ ones: `make`
@@ -42,6 +43,26 @@ func TestTheDeliveringWorkloadIsRequiredAndAPrincipalID(t *testing.T) {
 		required(t)
 		t.Setenv("REFERENCE_DELIVERY_PRINCIPAL_ID", value)
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REFERENCE_DELIVERY_PRINCIPAL_ID") {
+			t.Errorf("%q answered %v", value, err)
+		}
+	}
+}
+
+// The check defaults to a minute and is bounded by it: a run lands within one check of falling due, and
+// a minute is the shortest interval organization-control lets a consumer declare.
+func TestTheReconcileCheckIsAtMostAMinute(t *testing.T) {
+	required(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReconcileCheck != time.Minute {
+		t.Errorf("the default check is %s, want 1m", cfg.ReconcileCheck)
+	}
+	for _, value := range []string{"0s", "-1s", "61s"} {
+		required(t)
+		t.Setenv("REFERENCE_RECONCILE_CHECK_INTERVAL", value)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REFERENCE_RECONCILE_CHECK_INTERVAL") {
 			t.Errorf("%q answered %v", value, err)
 		}
 	}

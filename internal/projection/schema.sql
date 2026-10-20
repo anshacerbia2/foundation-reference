@@ -89,8 +89,15 @@ CREATE INDEX IF NOT EXISTS membership_applied_mark_idx
 -- membership as suspended because its Tenant was suspended meant the Tenant's restoration, which
 -- changes no Membership, never lifted it.
 --
--- Ordered by tenant_security_version, which increments on every published Tenant transition that
--- changes whether its contexts are valid, in either direction. An older event is discarded.
+-- Ordered by (tenant_security_version, tenant_version), compared as a row: left to right, the
+-- first unequal pair decides. The security version increments on every transition that changes
+-- whether the Tenant's contexts are valid, and tenant_version on every transition. Activation is one
+-- that moves only tenant_version, so the security version alone published the same value twice and
+-- discarded an activation that arrived after a snapshot of the provisioning Tenant
+-- (TDD-organization-control-002 §Published Events: "A transition that does not increment the
+-- security version publishes the same value twice, so it cannot order them"). A restore moves both by
+-- 10^9 (ADR-ORG-003 §5.5), so a withdrawal republished after it is newer than anything held here.
+-- An older event is discarded.
 CREATE TABLE IF NOT EXISTS projection.tenant (
     tenant_id uuid PRIMARY KEY,
 
@@ -99,6 +106,7 @@ CREATE TABLE IF NOT EXISTS projection.tenant (
     tenant_status text NOT NULL,
 
     tenant_security_version bigint NOT NULL CHECK (tenant_security_version > 0),
+    tenant_version          bigint NOT NULL CHECK (tenant_version > 0),
 
     -- The stream position of the event, or the snapshot mark when seeded. Kept for lag and triage.
     applied_mark bigint NOT NULL CHECK (applied_mark > 0),

@@ -74,6 +74,12 @@ type Config struct {
 	// would surface as every delivery refused rather than as a process that did not start.
 	DeliveryPrincipal string
 
+	// ReconcileCheck is how often the consumer reads its own registration to see whether a
+	// reconciliation is due (internal/reconcile). The interval itself is the one the registration
+	// declares (ADR-ORG-001 §5.7); a run lands within one check of falling due, so the check is at most
+	// a minute, the shortest interval organization-control accepts.
+	ReconcileCheck time.Duration
+
 	HTTPReadTimeout    time.Duration
 	HTTPWriteTimeout   time.Duration
 	HTTPRequestTimeout time.Duration
@@ -135,6 +141,12 @@ func Load() (Config, error) {
 
 	cfg.MaxProjectionAge = durationOr("REFERENCE_MAX_PROJECTION_AGE", 60*time.Second, &problems)
 	cfg.AuthorityTimeout = durationOr("REFERENCE_AUTHORITY_TIMEOUT", 2*time.Second, &problems)
+
+	cfg.ReconcileCheck = durationOr("REFERENCE_RECONCILE_CHECK_INTERVAL", time.Minute, &problems)
+	if cfg.ReconcileCheck <= 0 || cfg.ReconcileCheck > time.Minute {
+		problems = append(problems, fmt.Errorf("REFERENCE_RECONCILE_CHECK_INTERVAL is %s; it must be positive and "+
+			"at most 1m, the shortest reconciliation interval organization-control accepts", cfg.ReconcileCheck))
+	}
 
 	cfg.HTTPReadTimeout = durationOr("HTTP_READ_TIMEOUT", 10*time.Second, &problems)
 	cfg.HTTPWriteTimeout = durationOr("HTTP_WRITE_TIMEOUT", 30*time.Second, &problems)
