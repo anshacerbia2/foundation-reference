@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-reference-001
   title: Enforcing Projection Consumer for Membership and Tenant Authority
   owner: Core Platform Team
-  version: 0.1.0
+  version: 0.2.0
   status: proposed
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-10-20
-  last_reviewed: 2026-10-20
+  last_reviewed: 2026-10-21
   parent_sad:
     - SAD-004
 ---
@@ -16,7 +16,7 @@ doc_meta:
 # Enforcing Projection Consumer for Membership and Tenant Authority
 
 > **Proposed, pending ratification.** This design records what is already built and verified on
-> `main` (ROADMAP items 1 to 28). GDC-011 §2.3.4 has every new TDD start at `proposed`. GDC-000 §2.6
+> `main` (ROADMAP items 1 to 30). GDC-011 §2.3.4 has every new TDD start at `proposed`. GDC-000 §2.6
 > rule 7 makes approval the act of a named human authority on an exact commit, so CI and merge do not
 > approve it. At ratification, the status becomes `approved` and the version `1.0.0` in one commit
 > (GDC-000 §2.6 rule 6), and `last_reviewed` is that commit's date.
@@ -69,6 +69,18 @@ SAD-004 §7.6 names it as one of the two projection consumers: "The named consum
 | Organization Control | Deliveries from its dispatcher; the snapshot, frontier, registration and reconcile endpoints; the fresh authority check (§API / Interface) |
 | The issuer | Tokens for both roles, verified locally against `REFERENCE_JWKS_URL` (`STD-IAM-002 §3.5`) |
 | PostgreSQL 17 | Its own database: `platform.processed_event` and the `projection` schema |
+
+**The proof consumer container, for development and CI only (0.2.0, SAD-004 2.7.0 §4.1).** SAD-004
+draws `foundation-reference` in its container view as "proof consumer, dev and CI only", with its own
+database. The SAD: "`foundation-reference` is a container of the development server and CI, never of
+production". It is "the enforcing projection consumer that proves a Membership revocation here becomes
+a refused operation in another process", and "It has its own database on purpose: a consumer sharing
+this system's database could be updated by a join instead of by an event". "A production deployment
+registers no `foundation-reference` consumer and holds no workload credential for it." So in this
+repository: the consumer, its database and its registration with Organization Control exist on the
+development server and in CI (`systemproof/`); no production configuration, deployment or
+registration is written here, and none will be. Its production counterparts are the Identity Control
+Service and the products (SAD-004 §7.6).
 
 The delivery path is Direct Durable Delivery over HTTP (`ADR-GLB-016 §5.4`): the source relay calls
 a registered target acceptance API, which authenticates the source. Delivery is at least once, so the
@@ -492,6 +504,7 @@ bootstrap completes, every projection-backed operation is refused, which is corr
 | Relationship | Target |
 | :-- | :-- |
 | Parent system | SAD-004 — Scnehaux Organization Control, §7.6 (the named projection consumers) and §7.7 (projection bootstrap) |
+| Conforms to | SAD-004 2.7.0 §4.1 — drawn as the proof consumer container with its own database, for development and CI only; production registers no such consumer (0.2.0) |
 | Governed by | ADR-GLB-016 §5.4 — Direct Durable Delivery; §5.8 — consumer durability and idempotency |
 | Governed by | ADR-GLB-018 §5.1, §5.2, §5.4 — subscriptions, one delivery per consumer, one dispatcher per consumer; Alternative G, amended 2026-10-15 |
 | Governed by | ADR-ORG-001 §5.7 — runtime consumption, and a consumer that reconciles itself (amended 2026-10-20); §5.11 — the consumer registered by `principal_id` |
@@ -500,7 +513,7 @@ bootstrap completes, every projection-backed operation is refused, which is corr
 | Conforms to | STD-IAM-002 §3.5 — local verification, skew, and step 8, the current-state check |
 | Conforms to | STD-GLB-009 §Development Server Deployment rule 12 — alert rules under `observability/alerts/` |
 | Depends on | `TDD-foundation-platform-001` — inbox, envelope, delivery; `TDD-organization-control-002` — Published Events, Enforcement Budget, Reconciliation Interval |
-| Plan | `ROADMAP.md` items 1 to 29 |
+| Plan | `ROADMAP.md` items 1 to 30 |
 
 ## References
 

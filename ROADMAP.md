@@ -26,7 +26,7 @@ another process, and how long that takes (README).
 
 | TDD | Subject | Status |
 | :-- | :-- | :-- |
-| `TDD-foundation-reference-001` | Enforcing projection consumer for Membership and Tenant authority | proposed, pending ratification |
+| `TDD-foundation-reference-001` | Enforcing projection consumer for Membership and Tenant authority | proposed (0.2.0), pending ratification |
 
 The design moved out of the README into `TDD-foundation-reference-001` (item 29). It records what is
 already built. GDC-011 §2.3.4 starts every new TDD at `proposed`. It becomes `approved` at `1.0.0` when
@@ -67,6 +67,7 @@ Each line gives the item, its status, when, and the architecture section it impl
 | 27 | ✅ This ROADMAP, as the repository's plan | Done 2026-10-20 (#31) | scnehaux-architecture #102 (owner's living-docs rule) |
 | 28 | ✅ README: the interval this consumer runs on, the scheduler off without `REFERENCE_AUTHORITY_BASE_URL`, and the rebuild for `tenant_version NOT NULL` | Done 2026-10-20 (#31) | ADR-ORG-001 §5.7; ADR-ORG-003 §5.5 |
 | 29 | ✅ `TDD-foundation-reference-001`, the design record; the README keeps the run instructions and points to it | Done 2026-10-20 (#32); `proposed`, ratification is the owner's | GDC-000 C3; GDC-011; SAD-004 §7.6 |
+| 30 | ✅ `TDD-foundation-reference-001` 0.2.0 §Technical Context: drawn as the proof consumer container, with its own database, for dev and CI only; production registers no such consumer and holds no workload credential for it. No code changed: this repository already writes no production configuration | Done 2026-10-21 | SAD-004 2.7.0 §4.1, §7.6 |
 
 ### Pins and dependency moves
 
