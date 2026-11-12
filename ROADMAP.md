@@ -68,6 +68,7 @@ Each line gives the item, its status, when, and the architecture section it impl
 | 28 | ✅ README: the interval this consumer runs on, the scheduler off without `REFERENCE_AUTHORITY_BASE_URL`, and the rebuild for `tenant_version NOT NULL` | Done 2026-10-20 (#31) | ADR-ORG-001 §5.7; ADR-ORG-003 §5.5 |
 | 29 | ✅ `TDD-foundation-reference-001`, the design record; the README keeps the run instructions and points to it | Done 2026-10-20 (#32); `proposed`, ratification is the owner's | GDC-000 C3; GDC-011; SAD-004 §7.6 |
 | 30 | ✅ `TDD-foundation-reference-001` 0.2.0 §Technical Context: drawn as the proof consumer container, with its own database, for dev and CI only; production registers no such consumer and holds no workload credential for it. No code changed: this repository already writes no production configuration | Done 2026-10-21 | SAD-004 2.7.0 §4.1, §7.6 |
+| 31 | ✅ A failed scheduled run of `ci` alerts the Information Security Officer: `.github/workflows/scheduled-failure-alert.yml` opens one issue labelled `scheduled-failure`, assigned to the repository owner's account so GitHub notifies it whatever its watch settings; a further failure comments on it, and the next scheduled run that passes closes it | Done 2026-11-12 | ISMS-005 T4 (R21); ISMS-008 NC-1, NC-4 |
 
 ### Pins and dependency moves
 
